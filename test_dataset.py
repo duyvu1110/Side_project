@@ -3,20 +3,7 @@ from dataset import ZaloAIDataset
 from collate_fn import custom_collate_fn
 from torch.utils.data import DataLoader
 import torch
-def prepare_batch_inputs(batched_inputs, device, non_blocking=False):
-    """
-    Moves the padded batch to the device and renames keys
-    for the model's forward pass.
-    """
-    model_inputs = dict(
-        # Rename 'input_query_image' to 'src_sketch' for the model
-        src_sketch = batched_inputs['input_query_image'][0].to(device, non_blocking=non_blocking),
-        src_sketch_mask = batched_inputs['input_query_image'][1].to(device, non_blocking=non_blocking),
-        
-        src_video = batched_inputs['input_video'][0].to(device, non_blocking=non_blocking),
-        src_video_mask = batched_inputs['input_video'][1].to(device, non_blocking=non_blocking)
-    )
-    return model_inputs
+
 
 # ---
 # 5. TEST SCRIPT

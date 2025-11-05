@@ -495,97 +495,97 @@ def build_model(args):
 # 6. TEST SCRIPT
 # ---
 
-if __name__ == "__main__":
+# if __name__ == "__main__":
     
-    print("--- 1. Initializing Model ---")
+#     print("--- 1. Initializing Model ---")
 
-    # 1. Create a mock 'args' object to hold model config
-    class MockArgs:
-        # --- Model Config ---
-        backbone = 'resnet'
-        sketch_head = 'svanet'
-        hidden_dim = 256
-        nheads = 8
-        num_layers = 4        # From configs.py default
-        dim_feedforward = 1024 # From configs.py default
+#     # 1. Create a mock 'args' object to hold model config
+#     class MockArgs:
+#         # --- Model Config ---
+#         backbone = 'resnet'
+#         sketch_head = 'svanet'
+#         hidden_dim = 256
+#         nheads = 8
+#         num_layers = 4        # From configs.py default
+#         dim_feedforward = 1024 # From configs.py default
         
-        # --- Query Config ---
-        # 32 frames, 10 queries per frame = 320 total queries
-        num_queries = 320     
-        num_input_frames = 32 * 7 * 7 # T * H * W
-        num_input_sketches = 1
+#         # --- Query Config ---
+#         # 32 frames, 10 queries per frame = 320 total queries
+#         num_queries = 320     
+#         num_input_frames = 32 * 7 * 7 # T * H * W
+#         num_input_sketches = 1
         
-        # --- Embeddings & Projections ---
-        input_dropout = 0.4
-        n_input_proj = 2
-        dropout = 0.1
-        pre_norm = False
-        use_sketch_pos = True
-        sketch_position_embedding = 'sine'
-        video_position_embedding = 'sine'
+#         # --- Embeddings & Projections ---
+#         input_dropout = 0.4
+#         n_input_proj = 2
+#         dropout = 0.1
+#         pre_norm = False
+#         use_sketch_pos = True
+#         sketch_position_embedding = 'sine'
+#         video_position_embedding = 'sine'
         
-        # --- Loss & Other ---
-        aux_loss = True
-        vis_mode = None
+#         # --- Loss & Other ---
+#         aux_loss = True
+#         vis_mode = None
         
-        # --- Dims (will be set by build_backbone) ---
-        input_vid_dim = None
-        input_skch_dim = None
+#         # --- Dims (will be set by build_backbone) ---
+#         input_vid_dim = None
+#         input_skch_dim = None
 
-    args = MockArgs()
+#     args = MockArgs()
     
-    # 2. Build the model
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = build_model(args)
-    model.to(device)
-    model.train() # Set to train mode
+#     # 2. Build the model
+#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#     model = build_model(args)
+#     model.to(device)
+#     model.train() # Set to train mode
 
-    print(f"Model built successfully. Running on {device}.")
-    print(f"  Total Queries: {args.num_queries}")
-    print(f"  Hidden Dim: {args.hidden_dim}")
-    print(f"  Backbone Dims: Vid={args.input_vid_dim}, Sketch={args.input_skch_dim}")
+#     print(f"Model built successfully. Running on {device}.")
+#     print(f"  Total Queries: {args.num_queries}")
+#     print(f"  Hidden Dim: {args.hidden_dim}")
+#     print(f"  Backbone Dims: Vid={args.input_vid_dim}, Sketch={args.input_skch_dim}")
 
-    # 3. Create dummy inputs
-    print("\n--- 2. Creating Dummy Input ---")
-    BATCH_SIZE = 2
-    NUM_FRAMES = 32
+#     # 3. Create dummy inputs
+#     print("\n--- 2. Creating Dummy Input ---")
+#     BATCH_SIZE = 2
+#     NUM_FRAMES = 32
     
-    # (N, T, C, H, W)
-    dummy_video = torch.rand(BATCH_SIZE, NUM_FRAMES, 3, 224, 224).to(device)
-    # (N, T) - Mask is 1 for valid, 0 for padding. All valid here.
-    dummy_video_mask = torch.ones(BATCH_SIZE, NUM_FRAMES).to(device) 
+#     # (N, T, C, H, W)
+#     dummy_video = torch.rand(BATCH_SIZE, NUM_FRAMES, 3, 224, 224).to(device)
+#     # (N, T) - Mask is 1 for valid, 0 for padding. All valid here.
+#     dummy_video_mask = torch.ones(BATCH_SIZE, NUM_FRAMES).to(device) 
     
-    # (N, 1, C, H, W)
-    dummy_image = torch.rand(BATCH_SIZE, 1, 3, 224, 224).to(device)
-    # (N, 1) - All valid
-    dummy_image_mask = torch.ones(BATCH_SIZE, 1).to(device)
+#     # (N, 1, C, H, W)
+#     dummy_image = torch.rand(BATCH_SIZE, 1, 3, 224, 224).to(device)
+#     # (N, 1) - All valid
+#     dummy_image_mask = torch.ones(BATCH_SIZE, 1).to(device)
 
-    print(f"  Video Shape: {dummy_video.shape}")
-    print(f"  Image Shape: {dummy_image.shape}")
+#     print(f"  Video Shape: {dummy_video.shape}")
+#     print(f"  Image Shape: {dummy_image.shape}")
 
-    # 4. Run forward pass
-    print("\n--- 3. Running Forward Pass ---")
-    with torch.no_grad(): # We don't need gradients for this test
-        outputs = model(dummy_image, dummy_video, dummy_image_mask, dummy_video_mask)
+#     # 4. Run forward pass
+#     print("\n--- 3. Running Forward Pass ---")
+#     with torch.no_grad(): # We don't need gradients for this test
+#         outputs = model(dummy_image, dummy_video, dummy_image_mask, dummy_video_mask)
 
-    # 5. Print output shapes
-    print("\n--- 4. Inspecting Outputs ---")
-    print(f"  Output keys: {outputs.keys()}")
+#     # 5. Print output shapes
+#     print("\n--- 4. Inspecting Outputs ---")
+#     print(f"  Output keys: {outputs.keys()}")
     
-    # Check main output
-    print(f"  pred_logits shape: {outputs['pred_logits'].shape}")
-    print(f"  pred_boxes shape: {outputs['pred_boxes'].shape}")
+#     # Check main output
+#     print(f"  pred_logits shape: {outputs['pred_logits'].shape}")
+#     print(f"  pred_boxes shape: {outputs['pred_boxes'].shape}")
     
-    assert outputs['pred_logits'].shape == (BATCH_SIZE, args.num_queries, 2)
-    assert outputs['pred_boxes'].shape == (BATCH_SIZE, args.num_queries, 4)
+#     assert outputs['pred_logits'].shape == (BATCH_SIZE, args.num_queries, 2)
+#     assert outputs['pred_boxes'].shape == (BATCH_SIZE, args.num_queries, 4)
 
-    # Check auxiliary outputs
-    print(f"  aux_outputs length: {len(outputs['aux_outputs'])}")
-    assert len(outputs['aux_outputs']) == args.num_layers - 1
+#     # Check auxiliary outputs
+#     print(f"  aux_outputs length: {len(outputs['aux_outputs'])}")
+#     assert len(outputs['aux_outputs']) == args.num_layers - 1
     
-    print(f"  aux_outputs[0] logits shape: {outputs['aux_outputs'][0]['pred_logits'].shape}")
-    print(f"  aux_outputs[0] boxes shape: {outputs['aux_outputs'][0]['pred_boxes'].shape}")
-    assert outputs['aux_outputs'][0]['pred_logits'].shape == (BATCH_SIZE, args.num_queries, 2)
-    assert outputs['aux_outputs'][0]['pred_boxes'].shape == (BATCH_SIZE, args.num_queries, 4)
+#     print(f"  aux_outputs[0] logits shape: {outputs['aux_outputs'][0]['pred_logits'].shape}")
+#     print(f"  aux_outputs[0] boxes shape: {outputs['aux_outputs'][0]['pred_boxes'].shape}")
+#     assert outputs['aux_outputs'][0]['pred_logits'].shape == (BATCH_SIZE, args.num_queries, 2)
+#     assert outputs['aux_outputs'][0]['pred_boxes'].shape == (BATCH_SIZE, args.num_queries, 4)
     
-    print("\n✅ --- Model Test Passed --- ✅")
+#     print("\n✅ --- Model Test Passed --- ✅")

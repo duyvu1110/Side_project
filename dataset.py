@@ -184,5 +184,5 @@ class ZaloAIDataset(Dataset):
         targets['total_boxes'] = total_boxes
         targets['num_boxes_per_frame'] = num_boxes_per_frame
         targets['bboxes'] = bboxes # The dict of {frame_idx: [boxes]}
-        
+        targets['sampled_idxs'] = sampled_idxs
         return dict(model_inputs=model_inputs, targets=targets)
