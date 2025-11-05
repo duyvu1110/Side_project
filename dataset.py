@@ -53,6 +53,7 @@ class ZaloAIDataset(Dataset):
             
             # 'item["annotations"]' is a list of tracks (for re-appearance)
             for track_id, track in enumerate(item['annotations']):
+                print(len(track['bboxes']))
                 # 'track["bboxes"]' is a list of boxes in that track
                 for bbox_info in track['bboxes']:
                     frame_idx = bbox_info['frame']
