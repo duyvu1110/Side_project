@@ -359,7 +359,7 @@ def calculate_st_iou_batch(pred_logits, pred_boxes, targets, args):
 # 3. TRAIN & VALIDATE FUNCTIONS
 # ---
 
-def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, args, scaler):
+def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, args):
     model.train()
     criterion.train()
     
@@ -395,33 +395,33 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, arg
                 ]
             device_targets.append(dev_t)
 
-        # 3. Forward pass
-        with autocast():
-            outputs = model(**model_inputs)
-            loss_dict = criterion(outputs, device_targets)
-            
-            total_loss_batch = sum(
-                loss_dict[k] * criterion.weight_dict[k] 
-                for k in loss_dict.keys() if k in criterion.weight_dict
-            )
+        # 3. Forward pass (No autocast)
+        outputs = model(**model_inputs)
+        loss_dict = criterion(outputs, device_targets)
+        
+        total_loss_batch = sum(
+            loss_dict[k] * criterion.weight_dict[k] 
+            for k in loss_dict.keys() if k in criterion.weight_dict
+        )
 
         # 4. NaN/Inf check
         if not torch.isfinite(total_loss_batch):
             print(f"Warning: NaN or Inf loss detected at epoch {epoch}. Skipping batch.")
             continue
 
-        # 5. Backward pass
-        scaler.scale(total_loss_batch).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(optimizer)
-        scaler.update()
+        # 5. Standard backward pass (No scaler)
+        total_loss_batch.backward()
         
-        # 6. Log metrics
+        # 6. Gradient clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        
+        # 7. Standard optimizer step (No scaler)
+        optimizer.step()
+        
+        # 8. Log metrics
         num_batches += 1
         avg_loss_dict['total_loss'] += total_loss_batch.item()
         
-        # Find how many boxes the matcher *actually* paired
         with torch.no_grad():
             indices = criterion.matcher(outputs, device_targets)
             num_matches = sum(len(i[0]) for i in indices)
@@ -429,7 +429,7 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, arg
             avg_loss_dict['gt_boxes'] += total_gt_boxes_in_batch
 
         for k, v in loss_dict.items():
-            if k in criterion.weight_dict: # Only log losses that are weighted
+            if k in criterion.weight_dict:
                 avg_loss_dict[k] += v.item()
 
         if num_batches > 0:
