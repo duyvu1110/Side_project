@@ -78,7 +78,7 @@ def build_position_encoding(args):
             dropout=args.input_dropout
         )
     elif args.sketch_position_embedding == 'sine':
-        sketch_pos_embed = PositionEmbeddingSine(N_steps // 2, normalize=True)
+        sketch_pos_embed = PositionEmbeddingSine(N_steps, normalize=True)
     else:
         raise ValueError(f"not supported {args.sketch_position_embedding}")
 
