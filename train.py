@@ -79,64 +79,145 @@ class PerFrameMatcher(nn.Module):
         assert num_queries == self.num_frames * self.num_queries_per_frame
 
         out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)  # [B * N_q, 2]
-        out_bbox = outputs["pred_boxes"].flatten(0, 1)  # [B * N_q, 4]
+        out_bbox = outputs["pred_boxes"].flatten(0, 1)  # [B * N_q, 4] (cxcywh)
 
-        tgt_bbox = []
-        num_boxes = [] # List of num boxes per frame, flattened across batch
-        for tgt_video in targets:
-            num_boxes.extend(tgt_video['num_boxes_per_frame'])
-            # Iterate in the order of sampled frames
+        tgt_bbox_list = []
+        num_boxes_per_frame = [] # List of num boxes per frame, flattened across batch
+        video_ids_for_debug = []
+        
+        for i, tgt_video in enumerate(targets):
+            video_ids_for_debug.append(tgt_video['video'])
+            num_boxes_per_frame.extend(tgt_video['num_boxes_per_frame'])
             for frame_idx in tgt_video['sampled_idxs']:
                 for tgt_instance in tgt_video['bboxes'][frame_idx]:
-                    tgt_bbox.append(tgt_instance['bbox'])
+                    tgt_bbox_list.append(tgt_instance['bbox'])
 
-        if not tgt_bbox:
-            # No GT boxes in this batch
+        if not tgt_bbox_list:
             return [(torch.as_tensor([], dtype=torch.long), torch.as_tensor([], dtype=torch.long)) for _ in range(bs)]
 
-        tgt_bbox = torch.stack(tgt_bbox).to(out_bbox.device) # [total_boxes, 4]
+        tgt_bbox = torch.stack(tgt_bbox_list).to(out_bbox.device) # [total_boxes, 4] (cxcywh)
         tgt_ids = torch.full([tgt_bbox.shape[0]], self.foreground_label, device=out_bbox.device)
+
+        # ---
+        # ** START DEBUGGING BLOCK **
+        # ---
+        
+        try:
+            # Check model predictions
+            pred_xyxy = box_cxcywh_to_xyxy(out_bbox)
+            if not (pred_xyxy[:, 2:] >= pred_xyxy[:, :2]).all():
+                print("\n\n--- !!! DEBUG: Invalid MODEL PREDICTION found! ---")
+                invalid_preds = pred_xyxy[~(pred_xyxy[:, 2:] >= pred_xyxy[:, :2]).all(dim=-1)]
+                print(f"Found {len(invalid_preds)} invalid predicted boxes (x2 < x1 or y2 < y1).")
+                print("Example invalid predictions (xyxy):")
+                print(invalid_preds[:5])
+                # This should be impossible due to sigmoid, so it might be NaN
+                if torch.isnan(pred_xyxy).any():
+                    print("!!! ERROR: Model predictions contain NaNs! Check for gradient explosion. !!!")
+                
+            # Check ground truth targets
+            tgt_xyxy = box_cxcywh_to_xyxy(tgt_bbox)
+            if not (tgt_xyxy[:, 2:] >= tgt_xyxy[:, :2]).all():
+                print("\n\n--- !!! DEBUG: Invalid GROUND TRUTH found! ---")
+                invalid_gts = tgt_xyxy[~(tgt_xyxy[:, 2:] >= tgt_xyxy[:, :2]).all(dim=-1)]
+                print(f"Found {len(invalid_gts)} invalid GT boxes (x2 < x1 or y2 < y1).")
+                print("Example invalid GT boxes (xyxy):")
+                print(invalid_gts[:5])
+                
+                # Find which video this box came from (this is complex)
+                print("This invalid GT box came from one of these videos:", video_ids_for_debug)
+                print("Please check your annotation file or dataset preprocessing for these videos.")
+                
+        except Exception as e:
+            print(f"--- DEBUG: Error during box validation: {e} ---")
+
+        # ---
+        # ** END DEBUGGING BLOCK **
+        # ---
 
         cost_class = -out_prob[:, tgt_ids]
         cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
-        cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
+        
+        # This is the line that fails. We wrap it in a try-except.
+        try:
+            cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
+        except AssertionError as e:
+            print("\n\n--- !!! CRITICAL ERROR CAUGHT !!! ---")
+            print(f"AssertionError in generalized_box_iou: {e}")
+            
+            pred_xyxy = box_cxcywh_to_xyxy(out_bbox)
+            tgt_xyxy = box_cxcywh_to_xyxy(tgt_bbox)
 
+            # Check predictions
+            if not (pred_xyxy[:, 2:] >= pred_xyxy[:, :2]).all():
+                print("--- ERROR SOURCE: MODEL PREDICTIONS (boxes1) ---")
+                invalid_preds = pred_xyxy[~(pred_xyxy[:, 2:] >= pred_xyxy[:, :2]).all(dim=-1)]
+                print(f"Found {len(invalid_preds)} invalid predicted boxes (x2 < x1 or y2 < y1).")
+                print(invalid_preds[:5])
+            
+            # Check targets
+            elif not (tgt_xyxy[:, 2:] >= tgt_xyxy[:, :2]).all():
+                print("--- ERROR SOURCE: GROUND TRUTH (boxes2) ---")
+                invalid_gts = tgt_xyxy[~(tgt_xyxy[:, 2:] >= tgt_xyxy[:, :2]).all(dim=-1)]
+                print(f"Found {len(invalid_gts)} invalid GT boxes (x2 < x1 or y2 < y1).")
+                print(invalid_gts[:5])
+                print("Invalid boxes likely from one of these videos:", video_ids_for_debug)
+
+            else:
+                 print("--- ERROR SOURCE: UNKNOWN. Both preds and targets seem valid. ---")
+
+            # We must re-raise the error to stop the program
+            raise e
+
+        # --- Rest of the function (unchanged) ---
         C = self.cost_bbox * cost_bbox + self.cost_giou * cost_giou + self.cost_class * cost_class
         C = C.view(bs * self.num_frames, self.num_queries_per_frame, -1).cpu()
 
-        cum_num_boxes = np.cumsum(num_boxes)
+        cum_num_boxes = np.cumsum(num_boxes_per_frame)
         tgt_offsets = [0] + list(cum_num_boxes[:-1])
         indices = []
         
-        # C shape is (B*T, 10, total_boxes). We split along dim 2
-        frame_costs = C.split(num_boxes, -1)
+        frame_costs = C.split(num_boxes_per_frame, -1)
         
-        for i, (c, o) in enumerate(zip(frame_costs, tgt_offsets)):
-            # c[i] shape is (10, num_boxes_for_this_frame)
-            if c[i].shape[1] == 0: # No boxes for this frame
-                indices.append((np.array([]), np.array([])))
+        # This loop iterates (B * T) times
+        current_batch_video_idx = -1
+        current_tgt_offset = 0
+        
+        for i, (c, num_boxes_in_frame) in enumerate(zip(frame_costs, num_boxes_per_frame)):
+            # c shape is (10, num_boxes_in_frame)
+            if i % self.num_frames == 0:
+                current_batch_video_idx += 1
+                # Recalculate base_tgt_offset for the start of each new video in the batch
+                current_tgt_offset = sum(sum(t['num_boxes_per_frame'] for t in targets[:current_batch_video_idx]))
+            
+            if num_boxes_in_frame == 0: 
+                indices.append((np.array([], dtype=np.int64), np.array([], dtype=np.int64)))
                 continue
-            pred_ind, tgt_ind = linear_sum_assignment(c[i])
-            pred_ind += i * self.num_queries_per_frame
-            tgt_ind += o
+                
+            frame_tgt_offset = tgt_offsets[i]
+            
+            pred_ind, tgt_ind = linear_sum_assignment(c)
+            
+            pred_ind += (i * self.num_queries_per_frame) # Absolute pred index in flattened batch
+            # tgt_ind is relative to this frame's boxes, so we add the frame's offset
+            tgt_ind += frame_tgt_offset 
+            
             indices.append((pred_ind, tgt_ind))
 
         # Re-batch the indices
-        indices = [indices[i:i+self.num_frames] for i in range(0, len(indices), self.num_frames)]
+        indices_by_video_frame = [indices[i:i+self.num_frames] for i in range(0, len(indices), self.num_frames)]
         
         indices_per_video = []
-        for batch_idx, frame_indices in enumerate(indices):
+        for batch_idx, frame_indices in enumerate(indices_by_video_frame):
             pred_indices_per_video = []
             tgt_indices_per_video = []
             
-            # This logic is complex, it flattens all matched indices
-            # for the entire video.
             base_pred_offset = batch_idx * num_queries
             base_tgt_offset = sum(sum(t['num_boxes_per_frame'] for t in targets[:batch_idx]))
 
-            for pred_ind, tgt_ind in frame_indices:
-                pred_indices_per_video.extend(pred_ind.tolist())
-                tgt_indices_per_video.extend(tgt_ind.tolist())
+            for pred_ind_frame, tgt_ind_frame in frame_indices:
+                pred_indices_per_video.extend(pred_ind_frame.tolist())
+                tgt_indices_per_video.extend(tgt_ind_frame.tolist())
 
             # De-offset them to be relative to the video
             pred_indices_per_video = [p - base_pred_offset for p in pred_indices_per_video]
