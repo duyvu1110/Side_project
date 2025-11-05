@@ -89,7 +89,7 @@ def build_position_encoding(args):
             dropout=args.input_dropout
         )
     elif args.video_position_embedding == 'sine':
-        video_pos_embed = PositionEmbeddingSine(N_steps // 2, normalize=True)
+        video_pos_embed = PositionEmbeddingSine(N_steps, normalize=True)
     else:
         raise ValueError(f"not supported {args.video_position_embedding}")
 
