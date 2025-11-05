@@ -91,7 +91,7 @@ class ZaloAIDataset(Dataset):
         sampling_rate = total_video_frames / self.num_frames
         sampled_idxs = [int(round(sampling_rate * i)) for i in range(self.num_frames)]
         # Ensure indices are within bounds
-        sampled_idxs = [102,103,104,105,106]
+        sampled_idxs = [102,103,104,105,1811]
         
         # --- 4. Load Video Frames ---
         video_pil_frames = load_video_frames_at_indices(video_path, sampled_idxs)
