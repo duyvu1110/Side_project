@@ -579,7 +579,7 @@ def main():
         input_dropout = 0.4
         n_input_proj = 2
         dropout = 0.1
-        pre_norm = False
+        pre_norm = True
         use_sketch_pos = True
         sketch_position_embedding = 'sine'
         video_position_embedding = 'sine'
