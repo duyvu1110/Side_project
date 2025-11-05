@@ -137,14 +137,14 @@ class CrossModalTransformerLayer(nn.Module):
         self.norm1 = nn.LayerNorm(d_model)
         self.content_self_attn = nn.MultiheadAttention(d_model, nhead)
         self.norm2 = nn.LayerNorm(d_model)
-        self.mlp1 = CrossModalMLP(in_features=d_model, hidden_features=dim_feedforward, activation=activation) # Use renamed MLP
+        self.mlp1 = CrossModalMLP(in_features=d_model, hidden_features=dim_feedforward, activation=activation)
         self.norm3 = nn.LayerNorm(d_model)
 
         self.token_self_attn = nn.MultiheadAttention(d_model, nhead)
         self.norm4 = nn.LayerNorm(d_model)
         self.content_token_cross_attn = nn.MultiheadAttention(d_model, nhead)
         self.norm5 = nn.LayerNorm(d_model)
-        self.mlp2 = CrossModalMLP(in_features=d_model, hidden_features=dim_feedforward, activation=activation) # Use renamed MLP
+        self.mlp2 = CrossModalMLP(in_features=d_model, hidden_features=dim_feedforward, activation=activation)
         self.norm6 = nn.LayerNorm(d_model)
 
     def with_pos_embed(self, tensor, pos):
@@ -157,24 +157,32 @@ class CrossModalTransformerLayer(nn.Module):
             src_vid: [L_vid, bs, d]
             src_skch: [L_skch, bs, d] (L_skch is 1 in our case)
             out: [num_queries, bs, d]
-            vid_mask: [bs, L_vid]
-            skch_mask: [bs, L_skch]
+            vid_mask: [bs, L_vid] (Boolean mask, True for PADDED tokens)
+            skch_mask: [bs, L_skch] (Boolean mask, True for PADDED tokens)
             vid_pos: [L_vid, bs, d]
             skch_pos: [L_skch, bs, d]
             query_pos: [num_queries, bs, d]
         '''
-        # V1 (1x1)
         q = src_skch
         k = v = self.with_pos_embed(src_vid, vid_pos)
-        # Note: Original code att1 is [bs, 1, L]. This uses sketch as Q, video as K/V.
-        _, att1 = self.sketch_video_cross_attn(q, k, v)
-        mem = att1.permute(2, 0, 1) * src_vid  # [L, bs, 1] * [L, bs, d] = [L, bs, d]
+        
+        # ---
+        # ** FIX 1: Add key_padding_mask here **
+        # ---
+        _, att1 = self.sketch_video_cross_attn(q, k, v, key_padding_mask=vid_mask)
+        
+        mem = att1.permute(2, 0, 1) * src_vid
         mem = src_vid + mem
         mem = self.norm1(mem)
 
         q = k = self.with_pos_embed(mem, vid_pos)
         v = mem
-        mem, att2 = self.content_self_attn(q, k, v)
+        
+        # ---
+        # ** FIX 2: Add key_padding_mask here **
+        # ---
+        mem, att2 = self.content_self_attn(q, k, v, key_padding_mask=vid_mask)
+        
         mem = mem + v
         mem = self.norm2(mem)
         mem = mem + self.mlp1(mem)
@@ -182,6 +190,7 @@ class CrossModalTransformerLayer(nn.Module):
 
         q = k = self.with_pos_embed(out, query_pos)
         v = out
+        # This layer (token self-attn) doesn't need a mask, as queries are not padded
         out, att3 = self.token_self_attn(q, k, v)
         out = out + v
         out = self.norm4(out)
@@ -189,6 +198,7 @@ class CrossModalTransformerLayer(nn.Module):
         q = self.with_pos_embed(out, query_pos)
         k = self.with_pos_embed(mem, vid_pos)
         v = mem
+        # This layer already had the mask, which is correct
         out2, att4 = self.content_token_cross_attn(q, k, v, key_padding_mask=vid_mask)
         out = out + out2
         out = self.norm5(out)
@@ -340,18 +350,32 @@ class SVANet(nn.Module):
     def forward(self, src_sketch, src_sketch_mask, src_video, src_video_mask):
         """
         src_sketch: [batch_size, L_sketch, D_skch] (L_sketch=1)
-        src_sketch_mask: [batch_size, L_sketch] (L_sketch=1)
+        src_sketch_mask: [batch_size, L_sketch] (L_sketch=1, 1 is valid)
         src_video: [batch_size, L_video, D_vid] (L_video=T*H*W)
-        src_video_mask: [batch_size, L_video] (L_video=T*H*W)
+        src_video_mask: [batch_size, L_video] (L_video=T*H*W, 1 is valid)
         """
+        # ---
+        # ** THE FIX IS HERE **
+        # ---
+        
+        # 1. Project features
         src_video = self.input_video_proj(src_video)  # (bs, L_video, d)
-        mask_video = src_video_mask.bool()  # (bs, L_video)
-        pos_video = self.video_position_embed(src_video, ~mask_video) # (bs, L_video, d)
-
         src_sketch = self.input_sketch_proj(src_sketch)  # (bs, L_sketch, d)
-        mask_sketch = src_sketch_mask.bool()  # (bs, L_sketch)
-        pos_sketch = self.sketch_position_embed(src_sketch, ~mask_sketch)  # (bs, L_sketch, d)
 
+        # 2. Create positional embeddings
+        # PositionEmbeddingSine expects a mask where 1 is VALID.
+        # Your src_video_mask is already in this format.
+        pos_video = self.video_position_embed(src_video, src_video_mask) # (bs, L_video, d)
+        pos_sketch = self.sketch_position_embed(src_sketch, src_sketch_mask)  # (bs, L_sketch, d)
+
+        # 3. Create masks for the Transformer
+        # MultiheadAttention expects a mask where True is PADDED/INVALID.
+        # This is the INVERSE of your dataloader mask.
+        mask_video = ~src_video_mask.bool()  # (bs, L_video)
+        mask_sketch = ~src_sketch_mask.bool()  # (bs, L_sketch)
+
+        # --- END FIX ---
+        
         hs, att1, att2, att3, att4 = self.transformer(
             src_video, src_sketch, mask_video, mask_sketch, pos_video, pos_sketch, self.query_embed.weight
         )
