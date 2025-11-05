@@ -264,7 +264,19 @@ class SetCriterion(nn.Module):
             'labels': self.loss_labels,
             'boxes': self.loss_boxes,
         }
-        return loss_map[loss](outputs, targets, indices, **kwargs)
+        assert loss in loss_map, f'do you really want to compute {loss} loss?'
+
+        # ---
+        # ** THE FIX IS HERE **
+        # We manually check the loss type and only pass kwargs to the functions
+        # that actually accept them.
+        # ---
+        if loss == 'labels':
+            # loss_labels accepts the 'log' kwarg
+            return loss_map[loss](outputs, targets, indices, **kwargs)
+        elif loss == 'boxes':
+            # loss_boxes does *not* accept any kwargs
+            return loss_map[loss](outputs, targets, indices)
 
     def forward(self, outputs, targets):
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
