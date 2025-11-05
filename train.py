@@ -86,6 +86,7 @@ class PerFrameMatcher(nn.Module):
         video_ids_for_debug = []
         
         for i, tgt_video in enumerate(targets):
+            print(tgt_video.keys())
             video_ids_for_debug.append(tgt_video['video'])
             num_boxes_per_frame.extend(tgt_video['num_boxes_per_frame'])
             for frame_idx in tgt_video['sampled_idxs']:
@@ -441,11 +442,19 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, arg
         # 2. Prepare targets (move bboxes to device)
         device_targets = []
         for t in batched_targets:
+            # ---
+            # ** THE FIX IS HERE **
+            # We must copy all keys the loss/matcher need.
+            # ---
             dev_t = {
+                'video': t['video'],
+                'size': t['size'],
                 'num_boxes_per_frame': t['num_boxes_per_frame'],
                 'bboxes': {},
-                'sampled_idxs': t['sampled_idxs'] # We need this for the matcher
+                'sampled_idxs': t['sampled_idxs']
             }
+            # --- END FIX ---
+
             for frame_idx, boxes in t['bboxes'].items():
                 dev_t['bboxes'][frame_idx] = [
                     {'bbox': b['bbox'].to(device)} for b in boxes
@@ -472,11 +481,17 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, arg
         
         total_loss += total_loss_batch.item()
         num_batches += 1
-        pbar.set_postfix(loss=f"{total_loss / num_batches:.4f}")
+        
+        if num_batches > 0:
+            pbar.set_postfix(loss=f"{total_loss / num_batches:.4f}")
 
-    avg_loss = total_loss / num_batches
-    print(f"Epoch {epoch} [Training] Avg Loss: {avg_loss:.4f}")
-    return avg_loss
+    if num_batches > 0:
+        avg_loss = total_loss / num_batches
+        print(f"Epoch {epoch} [Training] Avg Loss: {avg_loss:.4f}")
+        return avg_loss
+    else:
+        print(f"Epoch {epoch} [Training] No valid batches found.")
+        return 0.0
 
 
 @torch.no_grad()
