@@ -109,20 +109,31 @@ class PerFrameMatcher(nn.Module):
         C = C.view(bs * self.num_frames, self.num_queries_per_frame, -1).cpu()
 
         cum_num_boxes = np.cumsum(num_boxes_per_frame)
-        tgt_offsets = [0] + list(cum_num_boxes[:-1]) # This has the correct offset for *each frame*
+        tgt_offsets = [0] + list(cum_num_boxes[:-1])
         indices = []
         
         frame_costs = C.split(num_boxes_per_frame, -1)
         
+        current_batch_video_idx = -1
+        
         for i, (c, num_boxes_in_frame) in enumerate(zip(frame_costs, num_boxes_per_frame)):
+            if i % self.num_frames == 0:
+                current_batch_video_idx += 1
+            
             if num_boxes_in_frame == 0: 
                 indices.append((np.array([], dtype=np.int64), np.array([], dtype=np.int64)))
                 continue
                 
-            # This is the correct offset for the current frame's boxes
             frame_tgt_offset = tgt_offsets[i]
             
-            pred_ind, tgt_ind = linear_sum_assignment(c)
+            # ---
+            # ** THE FIX IS HERE **
+            # We must slice c with [i] to get the 2D cost matrix for the current frame
+            # ---
+            cost_matrix_for_frame = c[i] # Shape (10, num_boxes_in_frame)
+            
+            pred_ind, tgt_ind = linear_sum_assignment(cost_matrix_for_frame)
+            # --- END FIX ---
             
             pred_ind += (i * self.num_queries_per_frame)
             tgt_ind += frame_tgt_offset 
@@ -137,20 +148,14 @@ class PerFrameMatcher(nn.Module):
             pred_indices_per_video = []
             tgt_indices_per_video = []
             
-            # ---
-            # ** THE FIX IS HERE **
-            # We need to get the total box count for all *previous* videos in the batch
-            # My old code was sum(sum(...)), which is a bug.
-            # The correct code is sum([sum(...)])
-            # ---
-            base_tgt_offset = sum( [sum(t['num_boxes_per_frame']) for t in targets[:batch_idx]] )
+            # This calculation was also fixed in the previous step
+            base_tgt_offset = sum([sum(t['num_boxes_per_frame']) for t in targets[:batch_idx]])
             base_pred_offset = batch_idx * num_queries
 
             for pred_ind_frame, tgt_ind_frame in frame_indices:
                 pred_indices_per_video.extend(pred_ind_frame.tolist())
                 tgt_indices_per_video.extend(tgt_ind_frame.tolist())
 
-            # De-offset them to be relative to the video
             pred_indices_per_video = [p - base_pred_offset for p in pred_indices_per_video]
             tgt_indices_per_video = [t - base_tgt_offset for t in tgt_indices_per_video]
 
