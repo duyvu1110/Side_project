@@ -7,7 +7,7 @@ from PIL import Image
 from collections import defaultdict
 from torch.utils.data import Dataset
 from torchvision import transforms
-from lib.utils.box_utils import box_xyxy_to_cxcywh
+from box_utils import box_xyxy_to_cxcywh
 from helper_function import load_video_frames_at_indices
 
 class ZaloAIDataset(Dataset):
