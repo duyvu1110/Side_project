@@ -545,7 +545,34 @@ def validate(model, data_loader, device, args):
 # ---
 # 4. MAIN FUNCTION
 # ---
+def nan_hook(module, inputs, output):
+    """
+    A simple hook function to check for NaNs in a module's output.
+    """
+    if isinstance(output, torch.Tensor):
+        if torch.isnan(output).any():
+            print(f"!!! NaN DETECTED IN OUTPUT OF: {module.__class__.__name__} !!!")
+            print("--- Input (first 5 values) ---")
+            if isinstance(inputs, tuple) and inputs:
+                print(inputs[0].detach().cpu().flatten()[:5])
+            print("--- Output (first 5 values) ---")
+            print(output.detach().cpu().flatten()[:5])
+            
+    elif isinstance(output, (list, tuple)):
+        for i, out in enumerate(output):
+             if isinstance(out, torch.Tensor) and torch.isnan(out).any():
+                print(f"!!! NaN DETECTED IN OUTPUT TENSOR {i} OF: {module.__class__.__name__} !!!")
+                print("--- Output (first 5 values) ---")
+                print(out.detach().cpu().flatten()[:5])
 
+def add_nan_check_hooks(model):
+    """
+    Recursively apply the nan_hook to all modules in the model.
+    """
+    for name, module in model.named_children():
+        if module is not None:
+            module.register_forward_hook(nan_hook)
+            add_nan_check_hooks(module) # Recurse
 def main():
     
     # --- 1. Configuration ---
@@ -617,6 +644,8 @@ def main():
     # --- 3. Setup Model, Loss, Optimizer ---
     print("Building model...")
     model = build_model(args).to(device)
+    print("!!! Adding NaN check hooks to all model layers... !!!")
+    add_nan_check_hooks(model)
     criterion = build_loss(args).to(device)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.LR, weight_decay=args.WD)
