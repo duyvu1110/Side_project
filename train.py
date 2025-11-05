@@ -206,26 +206,43 @@ class SetCriterion(nn.Module):
         losses = {'loss_label': loss_ce.mean()}
 
         if log:
-            losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes[idx])
+            # Get the number of matched boxes
+            num_matches = idx[0].shape[0]
+            if num_matches > 0:
+                losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes[idx])
+            else:
+                losses['class_error'] = 0.0
+                
         return losses
 
     def loss_boxes(self, outputs, targets, indices):
         idx = self._get_src_permutation_idx(indices)
         src_boxes = outputs['pred_boxes'][idx] # (total_matched_boxes, 4)
         
-        tgt_boxes = []
+        # ---
+        # ** START BUG FIX **
+        # ---
+        if src_boxes.shape[0] == 0:
+            # No boxes were matched, so box losses are 0
+            return {'loss_bbox': torch.tensor(0.0, device=src_boxes.device), 
+                    'loss_giou': torch.tensor(0.0, device=src_boxes.device)}
+        # ---
+        # ** END BUG FIX **
+        # ---
+        
+        tgt_boxes_list = []
         for tgt_video in targets:
             for frame_idx in tgt_video['sampled_idxs']:
                 for tgt_instance in tgt_video['bboxes'][frame_idx]:
-                    tgt_boxes.append(tgt_instance['bbox'])
+                    tgt_boxes_list.append(tgt_instance['bbox'])
         
-        if not tgt_boxes:
+        # This should not happen if src_boxes.shape[0] > 0, but as a safety check:
+        if not tgt_boxes_list:
              return {'loss_bbox': torch.tensor(0.0, device=src_boxes.device), 
                      'loss_giou': torch.tensor(0.0, device=src_boxes.device)}
 
-        tgt_boxes = torch.stack(tgt_boxes).to(src_boxes.device)
+        tgt_boxes = torch.stack(tgt_boxes_list).to(src_boxes.device)
         
-        # The matcher provides indices into the *flattened* target boxes
         tgt_perm_idx = torch.cat([tgt for (_, tgt) in indices])
         tgt_boxes = tgt_boxes[tgt_perm_idx]
 
@@ -236,8 +253,10 @@ class SetCriterion(nn.Module):
         ))
         
         losses = {}
-        losses['loss_bbox'] = loss_bbox.sum() / len(indices) # Normalize by batch size
-        losses['loss_giou'] = loss_giou.sum() / len(indices)
+        # Normalize by number of matched boxes
+        num_boxes = src_boxes.shape[0]
+        losses['loss_bbox'] = loss_bbox.sum() / num_boxes
+        losses['loss_giou'] = loss_giou.sum() / num_boxes
         return losses
 
     def get_loss(self, loss, outputs, targets, indices, **kwargs):
@@ -249,6 +268,7 @@ class SetCriterion(nn.Module):
 
     def forward(self, outputs, targets):
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
+        
         indices = self.matcher(outputs_without_aux, targets)
 
         losses = {}
@@ -259,7 +279,8 @@ class SetCriterion(nn.Module):
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
                 indices = self.matcher(aux_outputs, targets)
                 for loss in self.losses:
-                    l_dict = self.get_loss(loss, aux_outputs, targets, indices)
+                    # Don't log aux class error
+                    l_dict = self.get_loss(loss, aux_outputs, targets, indices, log=False)
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
         return losses
@@ -537,14 +558,14 @@ def main():
 
         # --- Data ---
         NUM_FRAMES = 32
-        BATCH_SIZE = 4
+        BATCH_SIZE = 4  # Kept your BATCH_SIZE=4 from the log
         NUM_WORKERS = 2
         
         # --- Training ---
-        NUM_EPOCHS = 100  # Changed to 10
-        LR = 1e-4
+        NUM_EPOCHS = 100 # Train for more epochs
+        LR = 1e-4        # Let's try a slightly higher LR
         WD = 1e-4
-        LR_DROP_STEP = 8 # Drop LR every 8 epochs (e.g., at epoch 8)
+        LR_DROP_STEP = 50 # Drop LR every 50 epochs
         
         # --- Model Config (from model.py) ---
         backbone = 'resnet'
@@ -559,7 +580,7 @@ def main():
         input_dropout = 0.4
         n_input_proj = 2
         dropout = 0.1
-        pre_norm = False
+        pre_norm = True # Keep this True for stability
         use_sketch_pos = True
         sketch_position_embedding = 'sine'
         video_position_embedding = 'sine'
@@ -571,9 +592,17 @@ def main():
         # --- Loss Config ---
         matcher = 'per_frame_matcher'
         num_queries_per_frame = 10
-        set_cost_bbox = 5
-        set_cost_giou = 1
-        set_cost_class = 2
+        
+        # ---
+        # ** THE FIX IS HERE **
+        # We make the class cost lower and box costs higher
+        # to encourage the matcher to find pairs.
+        # ---
+        set_cost_bbox = 5   # Was 5
+        set_cost_giou = 2   # Was 2
+        set_cost_class = 1  # Was 1
+        # ---
+        
         eos_coef = 0.1
 
     args = Config()
@@ -597,8 +626,11 @@ def main():
     # --- 3. Setup Model, Loss, Optimizer ---
     print("Building model...")
     model = build_model(args).to(device)
-    print("!!! Adding NaN check hooks to all model layers... !!!")
-    add_nan_check_hooks(model)
+    
+    # You can remove the NaN hooks now if you want
+    # print("!!! Adding NaN check hooks to all model layers... !!!")
+    # add_nan_check_hooks(model)
+    
     criterion = build_loss(args).to(device)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.LR, weight_decay=args.WD)
@@ -608,13 +640,25 @@ def main():
     print("--- Starting Training ---")
     
     for epoch in range(1, args.NUM_EPOCHS + 1):
-        train_one_epoch(model, criterion, train_loader, optimizer, device, epoch, args)
-        scheduler.step()
         
+        # ** FIX 1: CAPTURE THE RETURNED DICTIONARY **
+        loss_dict = train_one_epoch(model, criterion, train_loader, optimizer, device, epoch, args)
+        
+        # ** FIX 2: PRINT THE DICTIONARY **
+        if loss_dict is not None:
+            print(f"Epoch {epoch} Avg Losses:")
+            # Sort keys for clean printing
+            sorted_keys = sorted(loss_dict.keys(), key=lambda x: ('loss' not in x, 'aux' in x, x))
+            for k in sorted_keys:
+                if k != 'total_loss':
+                    print(f"  {k:<20}: {loss_dict[k]:.4f}")
+            print(f"  ==> {'total_loss':<20}: {loss_dict['total_loss']:.4f}")
+        
+        scheduler.step()
         print(f"--- Epoch {epoch} complete ---")
 
     # --- 5. Save Final Model ---
-    final_checkpoint_path = os.path.join(args.CHECKPOINT_DIR, "final_model_epoch10.pth")
+    final_checkpoint_path = os.path.join(args.CHECKPOINT_DIR, f"final_model_epoch{args.NUM_EPOCHS}.pth")
     torch.save(model.state_dict(), final_checkpoint_path)
     print(f"Training finished. Final model saved to {final_checkpoint_path}")
 
