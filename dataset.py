@@ -10,7 +10,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from box_utils import box_xyxy_to_cxcywh
 # ---
-from helper_functions import load_video_frames_at_indices
+from helper_function import load_video_frames_at_indices
 # 1. ZALO AI DATASET CLASS (CORRECTED)
 # ---
 
