@@ -53,7 +53,7 @@ class ZaloAIDataset(Dataset):
             
             # 'item["annotations"]' is a list of tracks (for re-appearance)
             for track_id, track in enumerate(item['annotations']):
-                print(len(track['bboxes']))
+
                 # 'track["bboxes"]' is a list of boxes in that track
                 for bbox_info in track['bboxes']:
                     frame_idx = bbox_info['frame']
@@ -118,7 +118,7 @@ class ZaloAIDataset(Dataset):
         sampling_rate = total_video_frames / self.num_frames
         sampled_idxs = [int(round(sampling_rate * i)) for i in range(self.num_frames)]
         sampled_idxs = [min(max(0, i), total_video_frames - 1) for i in sampled_idxs]
-        sampled_idxs = [101,102,103,1811,1812]
+        sampled_idxs = [2125,2126,2127,2585,2586]
         
         # --- 4. Load Video Frames ---
         video_pil_frames = load_video_frames_at_indices(video_path, sampled_idxs)
