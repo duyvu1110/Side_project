@@ -359,28 +359,28 @@ def calculate_st_iou_batch(pred_logits, pred_boxes, targets, args):
 # 3. TRAIN & VALIDATE FUNCTIONS
 # ---
 
-def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, args):
+def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, args, scaler):
     model.train()
     criterion.train()
     
-    total_loss = 0.0
+    # Use defaultdict to easily sum up losses
+    avg_loss_dict = defaultdict(float)
     num_batches = 0
     
     pbar = tqdm(data_loader, desc=f"Epoch {epoch} [Training]")
     for batched_inputs, batched_targets in pbar:
         if batched_inputs is None:
             continue
+            
+        optimizer.zero_grad(set_to_none=True)
 
-        # 1. Prepare inputs (moves to device)
+        # 1. Prepare inputs
         model_inputs = prepare_batch_inputs(batched_inputs, device)
         
-        # 2. Prepare targets (move bboxes to device)
+        # 2. Prepare targets
         device_targets = []
+        total_gt_boxes_in_batch = 0 # For debugging
         for t in batched_targets:
-            # ---
-            # ** THE FIX IS HERE **
-            # We must copy all keys the loss/matcher need.
-            # ---
             dev_t = {
                 'video': t['video'],
                 'size': t['size'],
@@ -388,8 +388,7 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, arg
                 'bboxes': {},
                 'sampled_idxs': t['sampled_idxs']
             }
-            # --- END FIX ---
-
+            total_gt_boxes_in_batch += t['total_boxes']
             for frame_idx, boxes in t['bboxes'].items():
                 dev_t['bboxes'][frame_idx] = [
                     {'bbox': b['bbox'].to(device)} for b in boxes
@@ -397,36 +396,55 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, arg
             device_targets.append(dev_t)
 
         # 3. Forward pass
-        outputs = model(**model_inputs)
-        
-        # 4. Calculate loss
-        loss_dict = criterion(outputs, device_targets)
-        
-        # 5. Calculate total weighted loss
-        total_loss_batch = sum(
-            loss_dict[k] * criterion.weight_dict[k] 
-            for k in loss_dict.keys() if k in criterion.weight_dict
-        )
+        with autocast():
+            outputs = model(**model_inputs)
+            loss_dict = criterion(outputs, device_targets)
+            
+            total_loss_batch = sum(
+                loss_dict[k] * criterion.weight_dict[k] 
+                for k in loss_dict.keys() if k in criterion.weight_dict
+            )
 
-        # 6. Backward pass
-        optimizer.zero_grad()
-        total_loss_batch.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # Gradient clipping
-        optimizer.step()
+        # 4. NaN/Inf check
+        if not torch.isfinite(total_loss_batch):
+            print(f"Warning: NaN or Inf loss detected at epoch {epoch}. Skipping batch.")
+            continue
+
+        # 5. Backward pass
+        scaler.scale(total_loss_batch).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
         
-        total_loss += total_loss_batch.item()
+        # 6. Log metrics
         num_batches += 1
+        avg_loss_dict['total_loss'] += total_loss_batch.item()
         
+        # Find how many boxes the matcher *actually* paired
+        with torch.no_grad():
+            indices = criterion.matcher(outputs, device_targets)
+            num_matches = sum(len(i[0]) for i in indices)
+            avg_loss_dict['matches'] += num_matches
+            avg_loss_dict['gt_boxes'] += total_gt_boxes_in_batch
+
+        for k, v in loss_dict.items():
+            if k in criterion.weight_dict: # Only log losses that are weighted
+                avg_loss_dict[k] += v.item()
+
         if num_batches > 0:
-            pbar.set_postfix(loss=f"{total_loss / num_batches:.4f}")
+            pbar.set_postfix(
+                loss=f"{avg_loss_dict['total_loss'] / num_batches:.4f}",
+                matches=f"{int(avg_loss_dict['matches'] / num_batches)}/{int(avg_loss_dict['gt_boxes'] / num_batches)}"
+            )
 
     if num_batches > 0:
-        avg_loss = total_loss / num_batches
-        print(f"Epoch {epoch} [Training] Avg Loss: {avg_loss:.4f}")
-        return avg_loss
+        # Normalize the averaged losses
+        final_loss_dict = {k: v / num_batches for k, v in avg_loss_dict.items()}
+        return final_loss_dict
     else:
         print(f"Epoch {epoch} [Training] No valid batches found.")
-        return 0.0
+        return None
 
 
 @torch.no_grad()
@@ -523,7 +541,7 @@ def main():
         NUM_WORKERS = 2
         
         # --- Training ---
-        NUM_EPOCHS = 10  # Changed to 10
+        NUM_EPOCHS = 100  # Changed to 10
         LR = 1e-4
         WD = 1e-4
         LR_DROP_STEP = 8 # Drop LR every 8 epochs (e.g., at epoch 8)
@@ -541,7 +559,7 @@ def main():
         input_dropout = 0.4
         n_input_proj = 2
         dropout = 0.1
-        pre_norm = True
+        pre_norm = False
         use_sketch_pos = True
         sketch_position_embedding = 'sine'
         video_position_embedding = 'sine'
