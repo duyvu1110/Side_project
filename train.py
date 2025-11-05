@@ -154,7 +154,7 @@ def build_matcher(args):
         cost_bbox=args.set_cost_bbox,
         cost_giou=args.set_cost_giou,
         cost_class=args.set_cost_class,
-        num_frames=args.num_frames,
+        num_frames=args.NUM_FRAMES,
         num_queries_per_frame=args.num_queries_per_frame
     )
 
