@@ -194,19 +194,30 @@ class SetCriterion(nn.Module):
         src_idx = torch.cat([src for (src, _) in indices])
         return batch_idx, src_idx
 
-    def loss_labels(self, outputs, targets, indices, log=True):
-        src_logits = outputs['pred_logits'] # (B, N_q, 2)
+    def get_num_boxes(self, targets):
+        """ Get the total number of GT boxes in the batch """
+        num_boxes = sum(t['total_boxes'] for t in targets)
+        num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=next(self.parameters()).device)
+        # In a distributed setting, this would be averaged, but for one GPU, this is fine.
+        return num_boxes
+
+    def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
+        src_logits = outputs['pred_logits']
         idx = self._get_src_permutation_idx(indices)
         
         target_classes = torch.full(src_logits.shape[:2], self.background_label,
                                     dtype=torch.int64, device=src_logits.device)
         target_classes[idx] = self.foreground_label
         
+        # ---
+        # ** FIX: Normalize by num_boxes **
+        # We compute the CE loss for all 320 queries, then take the sum
+        # and normalize by the number of GT boxes (not the number of queries).
+        # ---
         loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight, reduction="none")
-        losses = {'loss_label': loss_ce.mean()}
+        losses = {'loss_label': loss_ce.sum() / num_boxes}
 
         if log:
-            # Get the number of matched boxes
             num_matches = idx[0].shape[0]
             if num_matches > 0:
                 losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes[idx])
@@ -215,20 +226,13 @@ class SetCriterion(nn.Module):
                 
         return losses
 
-    def loss_boxes(self, outputs, targets, indices):
+    def loss_boxes(self, outputs, targets, indices, num_boxes):
         idx = self._get_src_permutation_idx(indices)
-        src_boxes = outputs['pred_boxes'][idx] # (total_matched_boxes, 4)
+        src_boxes = outputs['pred_boxes'][idx]
         
-        # ---
-        # ** START BUG FIX **
-        # ---
         if src_boxes.shape[0] == 0:
-            # No boxes were matched, so box losses are 0
             return {'loss_bbox': torch.tensor(0.0, device=src_boxes.device), 
                     'loss_giou': torch.tensor(0.0, device=src_boxes.device)}
-        # ---
-        # ** END BUG FIX **
-        # ---
         
         tgt_boxes_list = []
         for tgt_video in targets:
@@ -236,13 +240,7 @@ class SetCriterion(nn.Module):
                 for tgt_instance in tgt_video['bboxes'][frame_idx]:
                     tgt_boxes_list.append(tgt_instance['bbox'])
         
-        # This should not happen if src_boxes.shape[0] > 0, but as a safety check:
-        if not tgt_boxes_list:
-             return {'loss_bbox': torch.tensor(0.0, device=src_boxes.device), 
-                     'loss_giou': torch.tensor(0.0, device=src_boxes.device)}
-
         tgt_boxes = torch.stack(tgt_boxes_list).to(src_boxes.device)
-        
         tgt_perm_idx = torch.cat([tgt for (_, tgt) in indices])
         tgt_boxes = tgt_boxes[tgt_perm_idx]
 
@@ -253,46 +251,45 @@ class SetCriterion(nn.Module):
         ))
         
         losses = {}
-        # Normalize by number of matched boxes
-        num_boxes = src_boxes.shape[0]
+        # ---
+        # ** FIX: Normalize by num_boxes **
+        # ---
         losses['loss_bbox'] = loss_bbox.sum() / num_boxes
         losses['loss_giou'] = loss_giou.sum() / num_boxes
         return losses
 
-    def get_loss(self, loss, outputs, targets, indices, **kwargs):
+    def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
         loss_map = {
             'labels': self.loss_labels,
             'boxes': self.loss_boxes,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
 
-        # ---
-        # ** THE FIX IS HERE **
-        # We manually check the loss type and only pass kwargs to the functions
-        # that actually accept them.
-        # ---
         if loss == 'labels':
-            # loss_labels accepts the 'log' kwarg
-            return loss_map[loss](outputs, targets, indices, **kwargs)
+            return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
         elif loss == 'boxes':
-            # loss_boxes does *not* accept any kwargs
-            return loss_map[loss](outputs, targets, indices)
+            return loss_map[loss](outputs, targets, indices, num_boxes)
 
     def forward(self, outputs, targets):
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
         
         indices = self.matcher(outputs_without_aux, targets)
+        
+        # Get the total number of boxes (our normalization factor)
+        num_boxes = self.get_num_boxes(targets)
+        # Avoid division by zero if a batch has 0 boxes
+        if num_boxes == 0:
+             num_boxes = 1.0
 
         losses = {}
         for loss in self.losses:
-            losses.update(self.get_loss(loss, outputs, targets, indices))
+            losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes=num_boxes))
 
         if 'aux_outputs' in outputs:
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
                 indices = self.matcher(aux_outputs, targets)
                 for loss in self.losses:
-                    # Don't log aux class error
-                    l_dict = self.get_loss(loss, aux_outputs, targets, indices, log=False)
+                    l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes=num_boxes, log=False)
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
         return losses
@@ -396,7 +393,6 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, arg
     model.train()
     criterion.train()
     
-    # Use defaultdict to easily sum up losses
     avg_loss_dict = defaultdict(float)
     num_batches = 0
     
@@ -407,19 +403,18 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, arg
             
         optimizer.zero_grad(set_to_none=True)
 
-        # 1. Prepare inputs
         model_inputs = prepare_batch_inputs(batched_inputs, device)
         
-        # 2. Prepare targets
         device_targets = []
-        total_gt_boxes_in_batch = 0 # For debugging
+        total_gt_boxes_in_batch = 0
         for t in batched_targets:
             dev_t = {
                 'video': t['video'],
                 'size': t['size'],
                 'num_boxes_per_frame': t['num_boxes_per_frame'],
                 'bboxes': {},
-                'sampled_idxs': t['sampled_idxs']
+                'sampled_idxs': t['sampled_idxs'],
+                'total_boxes': t['total_boxes'] # Pass this for normalization
             }
             total_gt_boxes_in_batch += t['total_boxes']
             for frame_idx, boxes in t['bboxes'].items():
@@ -428,8 +423,9 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, arg
                 ]
             device_targets.append(dev_t)
 
-        # 3. Forward pass (No autocast)
         outputs = model(**model_inputs)
+        
+        # ** FIX: The criterion now handles normalization internally **
         loss_dict = criterion(outputs, device_targets)
         
         total_loss_batch = sum(
@@ -437,21 +433,14 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, arg
             for k in loss_dict.keys() if k in criterion.weight_dict
         )
 
-        # 4. NaN/Inf check
         if not torch.isfinite(total_loss_batch):
             print(f"Warning: NaN or Inf loss detected at epoch {epoch}. Skipping batch.")
             continue
 
-        # 5. Standard backward pass (No scaler)
         total_loss_batch.backward()
-        
-        # 6. Gradient clipping
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        
-        # 7. Standard optimizer step (No scaler)
         optimizer.step()
         
-        # 8. Log metrics
         num_batches += 1
         avg_loss_dict['total_loss'] += total_loss_batch.item()
         
@@ -472,7 +461,6 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, arg
             )
 
     if num_batches > 0:
-        # Normalize the averaged losses
         final_loss_dict = {k: v / num_batches for k, v in avg_loss_dict.items()}
         return final_loss_dict
     else:
@@ -570,52 +558,56 @@ def main():
 
         # --- Data ---
         NUM_FRAMES = 32
-        BATCH_SIZE = 4  # Kept your BATCH_SIZE=4 from the log
+        BATCH_SIZE = 8
         NUM_WORKERS = 2
         
         # --- Training ---
-        NUM_EPOCHS = 100 # Train for more epochs
-        LR = 1e-4        # Let's try a slightly higher LR
+        NUM_EPOCHS = 100
+        LR = 1e-4  # We can try a higher LR now that losses are stable
         WD = 1e-4
-        LR_DROP_STEP = 50 # Drop LR every 50 epochs
+        LR_DROP_STEP = 80
         
-        # --- Model Config (from model.py) ---
+        # --- Model Config ---
         backbone = 'resnet'
         sketch_head = 'svanet'
         hidden_dim = 256
         nheads = 8
         num_layers = 4
         dim_feedforward = 1024
-        num_queries = 320 # 32 frames * 10 queries/frame
+        num_queries = 320
         num_input_frames = 32 * 7 * 7
         num_input_sketches = 1
         input_dropout = 0.4
         n_input_proj = 2
         dropout = 0.1
-        pre_norm = True # Keep this True for stability
+        pre_norm = True
         use_sketch_pos = True
         sketch_position_embedding = 'sine'
         video_position_embedding = 'sine'
         aux_loss = True
         vis_mode = None
-        input_vid_dim = None # Set by build_backbone
-        input_skch_dim = None # Set by build_backbone
+        input_vid_dim = None
+        input_skch_dim = None
 
         # --- Loss Config ---
         matcher = 'per_frame_matcher'
         num_queries_per_frame = 10
         
         # ---
-        # ** THE FIX IS HERE **
-        # We make the class cost lower and box costs higher
-        # to encourage the matcher to find pairs.
+        # ** NEW WEIGHTS for new normalization **
         # ---
-        set_cost_bbox = 5   # Was 5
-        set_cost_giou = 2   # Was 2
-        set_cost_class = 1  # Was 1
-        # ---
+        set_cost_bbox = 5.0
+        set_cost_giou = 2.0
+        set_cost_class = 1.0 # Matcher costs are unchanged
         
-        eos_coef = 0.1
+        eos_coef = 0.1 # This is the weight for "no-object" class in loss_label
+        
+        # ---
+        # ** NEW LOSS WEIGHTS for total loss **
+        # ---
+        loss_weight_bbox = 5.0
+        loss_weight_giou = 2.0
+        loss_weight_label = 1.0
 
     args = Config()
     os.makedirs(args.CHECKPOINT_DIR, exist_ok=True)
@@ -639,12 +631,25 @@ def main():
     print("Building model...")
     model = build_model(args).to(device)
     
-    # You can remove the NaN hooks now if you want
-    # print("!!! Adding NaN check hooks to all model layers... !!!")
-    # add_nan_check_hooks(model)
-    
+    # ---
+    # ** FIX: Pass new loss weights to build_loss **
+    # ---
     criterion = build_loss(args).to(device)
     
+    # Manually set the final loss weights in the criterion
+    # (The build_loss function you have doesn't do this automatically)
+    criterion.weight_dict = {
+        "loss_bbox": args.loss_weight_bbox,
+        "loss_giou": args.loss_weight_giou,
+        "loss_label": args.loss_weight_label
+    }
+    if args.aux_loss:
+        aux_weight_dict = {}
+        for i in range(args.num_layers - 1):
+            aux_weight_dict.update({k + f'_{i}': v for k, v in criterion.weight_dict.items()})
+        criterion.weight_dict.update(aux_weight_dict)
+    # --- END FIX ---
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.LR, weight_decay=args.WD)
     scheduler = StepLR(optimizer, step_size=args.LR_DROP_STEP, gamma=0.1)
 
@@ -653,13 +658,10 @@ def main():
     
     for epoch in range(1, args.NUM_EPOCHS + 1):
         
-        # ** FIX 1: CAPTURE THE RETURNED DICTIONARY **
         loss_dict = train_one_epoch(model, criterion, train_loader, optimizer, device, epoch, args)
         
-        # ** FIX 2: PRINT THE DICTIONARY **
         if loss_dict is not None:
             print(f"Epoch {epoch} Avg Losses:")
-            # Sort keys for clean printing
             sorted_keys = sorted(loss_dict.keys(), key=lambda x: ('loss' not in x, 'aux' in x, x))
             for k in sorted_keys:
                 if k != 'total_loss':
@@ -673,7 +675,6 @@ def main():
     final_checkpoint_path = os.path.join(args.CHECKPOINT_DIR, f"final_model_epoch{args.NUM_EPOCHS}.pth")
     torch.save(model.state_dict(), final_checkpoint_path)
     print(f"Training finished. Final model saved to {final_checkpoint_path}")
-
 
 if __name__ == "__main__":
     main()
