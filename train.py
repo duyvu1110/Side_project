@@ -635,10 +635,6 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.LR, weight_decay=args.WD)
     scheduler = StepLR(optimizer, step_size=args.LR_DROP_STEP, gamma=0.1)
-    model, optimizer = torch.cuda.amp.initialize(model, optimizer,
-                                      opt_level=00,
-                                      keep_batchnorm_fp32=None,
-                                      loss_scale=1.0)
     scaler = GradScaler()
     # --- 4. Training Loop ---
     print("--- Starting Training ---")
