@@ -364,7 +364,7 @@ def calculate_st_iou_batch(pred_logits, pred_boxes, targets, args):
 # 3. TRAIN & VALIDATE FUNCTIONS
 # ---
 
-def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, args, scaler):
+def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, args):
     model.train()
     criterion.train()
     
@@ -398,14 +398,13 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, arg
                 ]
             device_targets.append(dev_t)
 
-        with autocast():
-            outputs = model(**model_inputs)
-            loss_dict = criterion(outputs, device_targets)
-            
-            total_loss_batch = sum(
-                loss_dict[k] * criterion.weight_dict[k] 
-                for k in loss_dict.keys() if k in criterion.weight_dict
-            )
+        outputs = model(**model_inputs)
+        loss_dict = criterion(outputs, device_targets)
+        
+        total_loss_batch = sum(
+            loss_dict[k] * criterion.weight_dict[k] 
+            for k in loss_dict.keys() if k in criterion.weight_dict
+        )
         
         # ** FIX: The criterion now handles normalization internally **
         # loss_dict = criterion(outputs, device_targets)
@@ -421,7 +420,7 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, arg
         # with torch.cuda.amp.scale_loss(total_loss_batch, optimizer) as scaled_losses:
         #     scaled_losses.backward()
         # total_loss_batch.backward()
-        scaler.scale(total_loss_batch).backward()
+        total_loss_batch.backward()
         optimizer.step()
         
         num_batches += 1
@@ -635,13 +634,12 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.LR, weight_decay=args.WD)
     scheduler = StepLR(optimizer, step_size=args.LR_DROP_STEP, gamma=0.1)
-    scaler = GradScaler()
     # --- 4. Training Loop ---
     print("--- Starting Training ---")
     
     for epoch in range(1, args.NUM_EPOCHS + 1):
         
-        loss_dict = train_one_epoch(model, criterion, train_loader, optimizer, device, epoch, args, scaler)
+        loss_dict = train_one_epoch(model, criterion, train_loader, optimizer, device, epoch, args)
         
         if loss_dict is not None:
             print(f"Epoch {epoch} Avg Losses:")
