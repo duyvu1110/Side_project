@@ -563,7 +563,7 @@ def main():
 
         # --- Data ---
         NUM_FRAMES = 32
-        BATCH_SIZE = 8
+        BATCH_SIZE = 4
         NUM_WORKERS = 2
         
         # --- Training ---
