@@ -197,7 +197,12 @@ class SetCriterion(nn.Module):
     def get_num_boxes(self, targets):
         """ Get the total number of GT boxes in the batch """
         num_boxes = sum(t['total_boxes'] for t in targets)
-        num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=next(self.parameters()).device)
+        
+        # --- THIS IS THE FIX ---
+        # Get device from the registered buffer 'empty_weight' instead of parameters
+        num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=self.empty_weight.device)
+        # --- END FIX ---
+        
         # In a distributed setting, this would be averaged, but for one GPU, this is fine.
         return num_boxes
 
