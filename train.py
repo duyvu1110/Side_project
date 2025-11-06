@@ -567,7 +567,7 @@ def main():
         
         # --- Training ---
         NUM_EPOCHS = 100
-        LR = 1e-4  # We can try a higher LR now that losses are stable
+        LR = 1e-5  # We can try a higher LR now that losses are stable
         WD = 1e-4
         LR_DROP_STEP = 80
         
@@ -609,7 +609,7 @@ def main():
         # ---
         # ** NEW LOSS WEIGHTS for total loss **
         # ---
-        loss_weight_bbox = 5.0
+        loss_weight_bbox = 1.0
         loss_weight_giou = 2.0
         loss_weight_label = 1.0
 
