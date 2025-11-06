@@ -532,8 +532,8 @@ def main():
 
         # --- Data ---
         NUM_FRAMES = 32
-        BATCH_SIZE = 4
-        NUM_WORKERS = 2
+        BATCH_SIZE = 2
+        NUM_WORKERS = 4
         
         # --- Training ---
         NUM_EPOCHS = 100
