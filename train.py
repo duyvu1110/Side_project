@@ -411,7 +411,7 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, arg
         if not torch.isfinite(total_loss_batch):
             print(f"Warning: NaN or Inf loss detected at epoch {epoch}. Skipping batch.")
             continue
-        with torch.amp.scale_loss(total_loss_batch, optimizer) as scaled_losses:
+        with torch.cuda.amp.scale_loss(total_loss_batch, optimizer) as scaled_losses:
             scaled_losses.backward()
         # total_loss_batch.backward()
         optimizer.step()
@@ -627,7 +627,7 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.LR, weight_decay=args.WD)
     scheduler = StepLR(optimizer, step_size=args.LR_DROP_STEP, gamma=0.1)
-    model, optimizer = torch.amp.initialize(model, optimizer,
+    model, optimizer = torch.cuda.amp.initialize(model, optimizer,
                                       opt_level=00,
                                       keep_batchnorm_fp32=None,
                                       loss_scale=1.0)
