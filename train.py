@@ -364,7 +364,7 @@ def calculate_st_iou_batch(pred_logits, pred_boxes, targets, args):
 # 3. TRAIN & VALIDATE FUNCTIONS
 # ---
 
-def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, args):
+def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, args, scaler):
     model.train()
     criterion.train()
     
@@ -398,22 +398,30 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, arg
                 ]
             device_targets.append(dev_t)
 
-        outputs = model(**model_inputs)
+        with autocast():
+            outputs = model(**model_inputs)
+            loss_dict = criterion(outputs, device_targets)
+            
+            total_loss_batch = sum(
+                loss_dict[k] * criterion.weight_dict[k] 
+                for k in loss_dict.keys() if k in criterion.weight_dict
+            )
         
         # ** FIX: The criterion now handles normalization internally **
-        loss_dict = criterion(outputs, device_targets)
+        # loss_dict = criterion(outputs, device_targets)
         
-        total_loss_batch = sum(
-            loss_dict[k] * criterion.weight_dict[k] 
-            for k in loss_dict.keys() if k in criterion.weight_dict
-        )
-
+        # total_loss_batch = sum(
+        #     loss_dict[k] * criterion.weight_dict[k] 
+        #     for k in loss_dict.keys() if k in criterion.weight_dict
+        # )
+        
         if not torch.isfinite(total_loss_batch):
             print(f"Warning: NaN or Inf loss detected at epoch {epoch}. Skipping batch.")
             continue
-        with torch.cuda.amp.scale_loss(total_loss_batch, optimizer) as scaled_losses:
-            scaled_losses.backward()
+        # with torch.cuda.amp.scale_loss(total_loss_batch, optimizer) as scaled_losses:
+        #     scaled_losses.backward()
         # total_loss_batch.backward()
+        scaler.scale(total_loss_batch).backward()
         optimizer.step()
         
         num_batches += 1
@@ -580,9 +588,9 @@ def main():
         # ---
         # ** NEW LOSS WEIGHTS for total loss **
         # ---
-        loss_weight_bbox = 1.0
-        loss_weight_giou = 2.0
-        loss_weight_label = 1.0
+        loss_weight_bbox = 5.0
+        loss_weight_giou = 1.0
+        loss_weight_label = 2.0
 
     args = Config()
     os.makedirs(args.CHECKPOINT_DIR, exist_ok=True)
@@ -631,13 +639,13 @@ def main():
                                       opt_level=00,
                                       keep_batchnorm_fp32=None,
                                       loss_scale=1.0)
-    
+    scaler = GradScaler()
     # --- 4. Training Loop ---
     print("--- Starting Training ---")
     
     for epoch in range(1, args.NUM_EPOCHS + 1):
         
-        loss_dict = train_one_epoch(model, criterion, train_loader, optimizer, device, epoch, args)
+        loss_dict = train_one_epoch(model, criterion, train_loader, optimizer, device, epoch, args, scaler)
         
         if loss_dict is not None:
             print(f"Epoch {epoch} Avg Losses:")
