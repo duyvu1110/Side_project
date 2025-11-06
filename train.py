@@ -8,7 +8,7 @@ from scipy.optimize import linear_sum_assignment
 from collections import defaultdict
 import os
 from tqdm import tqdm
-
+from torch.cuda.amp import GradScaler, autocast
 # --- Imports from our other files ---
 from model import build_model
 from dataset import ZaloAIDataset
@@ -411,8 +411,9 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, arg
         if not torch.isfinite(total_loss_batch):
             print(f"Warning: NaN or Inf loss detected at epoch {epoch}. Skipping batch.")
             continue
-
-        total_loss_batch.backward()
+        with torch.amp.scale_loss(total_loss_batch, optimizer) as scaled_losses:
+            scaled_losses.backward()
+        # total_loss_batch.backward()
         optimizer.step()
         
         num_batches += 1
@@ -537,7 +538,7 @@ def main():
         
         # --- Training ---
         NUM_EPOCHS = 100
-        LR = 1e-5  # We can try a higher LR now that losses are stable
+        LR = 1e-4  # We can try a higher LR now that losses are stable
         WD = 1e-4
         LR_DROP_STEP = 80
         
@@ -571,8 +572,8 @@ def main():
         # ** NEW WEIGHTS for new normalization **
         # ---
         set_cost_bbox = 5.0
-        set_cost_giou = 2.0
-        set_cost_class = 1.0 # Matcher costs are unchanged
+        set_cost_giou = 1.0
+        set_cost_class = 2.0 # Matcher costs are unchanged
         
         eos_coef = 0.1 # This is the weight for "no-object" class in loss_label
         
@@ -626,7 +627,11 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.LR, weight_decay=args.WD)
     scheduler = StepLR(optimizer, step_size=args.LR_DROP_STEP, gamma=0.1)
-
+    model, optimizer = torch.amp.initialize(model, optimizer,
+                                      opt_level=00,
+                                      keep_batchnorm_fp32=None,
+                                      loss_scale=1.0)
+    
     # --- 4. Training Loop ---
     print("--- Starting Training ---")
     
