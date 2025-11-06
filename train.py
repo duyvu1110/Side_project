@@ -443,7 +443,6 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, arg
             continue
 
         total_loss_batch.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         
         num_batches += 1
