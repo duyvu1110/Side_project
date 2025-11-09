@@ -386,7 +386,7 @@ def main():
 
     # --- 3. Setup Model, Loss, Optimizer ---
     print("Building model...")
-    model = ZaloTrackerNet(num_frames=args.NUM_FRAMES).to(device)
+    model = ZaloTrackerNet().to(device)
     
     # Simple dictionary for loss weights
     loss_weights = {
