@@ -9,7 +9,7 @@ import os
 from tqdm import tqdm
 
 # --- Imports from our other files ---
-from tracker_model import ZaloTrackerNet # <-- Our ResNet-34 model
+from model import ZaloTrackerNet # <-- Our ResNet-34 model
 from dataset import ZaloAIDataset
 from collate_fn import custom_collate_fn # <-- REMOVED 'prepare_batch_inputs'
 from box_utils import box_cxcywh_to_xyxy, generalized_box_iou
