@@ -214,7 +214,7 @@ def train_one_epoch(model, loss_weights, data_loader, optimizer, device, epoch, 
 
         model_inputs = {
             'input_query_image': query_images,
-            'input_video': batched_inputs['input_video'].to(device)
+            'input_video': batched_inputs['input_video'][0].to(device)
         }
         
         outputs = model(**model_inputs)
