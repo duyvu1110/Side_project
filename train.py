@@ -370,7 +370,7 @@ def main():
     # --- 1. Configuration ---
     class Config:
         # --- Paths ---
-        KAGGLE_ROOT = "./zalo_data" # <-- Using a local path for testing
+        KAGGLE_ROOT = "/kaggle/input/zaloai" # <-- Using a local path for testing
         TRAIN_ROOT = os.path.join(KAGGLE_ROOT, "train")
         CHECKPOINT_DIR = "./checkpoints"
 
