@@ -273,6 +273,10 @@ def train_one_epoch(model, loss_weights, data_loader, optimizer, device, epoch, 
         # our ZaloTrackerNet model accepts.
         # This removes the 'src_sketch' argument.
         # ---
+        try:
+            query_images = torch.stack(batched_inputs['input_query_image']).to(device)
+        except TypeError:
+            query_images = batched_inputs['input_query_image'].to(device)
         model_inputs = {
             'input_query_image': batched_inputs['input_query_image'].to(device),
             'input_video': batched_inputs['input_video'].to(device)
