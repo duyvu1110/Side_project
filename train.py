@@ -9,9 +9,9 @@ import os
 from tqdm import tqdm
 
 # --- Imports from our other files ---
-from model import ZaloTrackerNet # <-- Our ResNet-34 model
+from tracker_model import ZaloTrackerNet # <-- Our ResNet-34 model
 from dataset import ZaloAIDataset
-from collate_fn import custom_collate_fn, prepare_batch_inputs
+from collate_fn import custom_collate_fn # <-- REMOVED 'prepare_batch_inputs'
 from box_utils import box_cxcywh_to_xyxy, generalized_box_iou
 
 # ---
@@ -257,7 +257,17 @@ def train_one_epoch(model, loss_weights, data_loader, optimizer, device, epoch, 
             
         optimizer.zero_grad(set_to_none=True)
 
-        model_inputs = prepare_batch_inputs(batched_inputs, device)
+        # ---
+        # ** THE FIX IS HERE **
+        # We manually create the model_inputs dict with *only* the keys
+        # our ZaloTrackerNet model accepts.
+        # This removes the 'src_sketch' argument.
+        # ---
+        # model_inputs = prepare_batch_inputs(batched_inputs, device) # <-- OLD LINE
+        model_inputs = {
+            'input_query_image': batched_inputs['input_query_image'].to(device),
+            'input_video': batched_inputs['input_video'].to(device)
+        }
         
         # We also need to move target boxes to device, but we'll do it
         # inside the compute_losses function as we build the maps.
@@ -310,8 +320,17 @@ def validate(model, data_loader, device, args):
     for batched_inputs, batched_targets in pbar:
         if batched_inputs is None:
             continue
-
-        model_inputs = prepare_batch_inputs(batched_inputs, device)
+            
+        # ---
+        # ** THE FIX IS HERE **
+        # Apply the same fix as in the training loop.
+        # ---
+        # model_inputs = prepare_batch_inputs(batched_inputs, device) # <-- OLD LINE
+        model_inputs = {
+            'input_query_image': batched_inputs['input_query_image'].to(device),
+            'input_video': batched_inputs['input_video'].to(device)
+        }
+        
         outputs = model(**model_inputs)
         
         inter, union = calculate_st_iou_batch(
@@ -343,7 +362,7 @@ def main():
     # --- 1. Configuration ---
     class Config:
         # --- Paths ---
-        KAGGLE_ROOT = "/kaggle/input/zaloai/" # <-- Using a local path for testing
+        KAGGLE_ROOT = "./zalo_data" # <-- Using a local path for testing
         TRAIN_ROOT = os.path.join(KAGGLE_ROOT, "train")
         CHECKPOINT_DIR = "./checkpoints"
 
@@ -403,7 +422,6 @@ def main():
     
     for epoch in range(1, args.NUM_EPOCHS + 1):
         
-        loss_dict = train_one_epoch(
             model, 
             loss_weights, 
             train_loader, 
