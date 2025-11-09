@@ -17,78 +17,36 @@ from box_utils import box_cxcywh_to_xyxy, generalized_box_iou
 # ---
 # 1. NEW LOSS FUNCTIONS
 # ---
-
-class FocalLoss(nn.Module):
-    """
-    A simple implementation of Focal Loss for binary classification.
-    Assumes logits as input (not sigmoid!) and class indices (0 or 1).
-    """
-    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
-        super(FocalLoss, self).__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.reduction = reduction
-
-    def forward(self, inputs, targets):
-        # inputs shape: [N, 2, ...] (logits for 0 and 1)
-        # targets shape: [N, ...] (long tensor of 0 or 1)
-        
-        # Get probabilities
-        p = torch.softmax(inputs, dim=1)
-        
-        # Gather probabilities for the target class
-        # targets.unsqueeze(1) -> [N, 1, ...]
-        # p_t -> [N, ...]
-        p_t = p.gather(1, targets.unsqueeze(1)).squeeze(1)
-        
-        # Get cross-entropy loss
-        # We need to one-hot encode targets for binary_cross_entropy_with_logits
-        # and permute to [N, C, H, W]
-        targets_one_hot = F.one_hot(targets, num_classes=2).float()
-        if targets_one_hot.dim() > 2: # Handle 2D grid
-             targets_one_hot = targets_one_hot.permute(0, 3, 1, 2)
-             
-        ce_loss = F.binary_cross_entropy_with_logits(
-            inputs, 
-            targets_one_hot,
-            reduction='none'
-        ).sum(dim=1) # Sum over the class dimension
-        
-        # Calculate alpha weight
-        alpha_t = torch.where(targets == 1, self.alpha, 1.0 - self.alpha)
-        
-        # Calculate focal loss
-        loss = alpha_t * torch.pow(1 - p_t, self.gamma) * ce_loss
-        
-        if self.reduction == 'mean':
-            return loss.mean()
-        elif self.reduction == 'sum':
-            return loss.sum()
-        else:
-            return loss
-
 def compute_losses(outputs, targets, loss_weights, grid_size=7):
     """
-    Computes the dense losses for the ZaloTrackerNet.
+    Computes the dense losses for the 1-CHANNEL ZaloTrackerNet.
     
     Args:
         outputs (dict): From model, contains:
-            'pred_logits': [B, T, 2, 7, 7]
-            'pred_boxes': [B, T, 4, 7, 7]
+            'pred_logits': [B, T, 49, 1]
+            'pred_boxes': [B, T, 49, 4]
         targets (list[dict]): The batch of targets from the dataloader.
         loss_weights (dict): Weights for each loss type.
         grid_size (int): The size of the prediction grid (e.g., 7).
     """
     
-    pred_logits = outputs['pred_logits'] # [B, T, 2, 7, 7]
-    pred_boxes = outputs['pred_boxes']   # [B, T, 4, 7, 7]
+    # Model outputs are [B, T, 49, C]
+    pred_logits_flat = outputs['pred_logits'] # [B, T, 49, 1]
+    pred_boxes_flat = outputs['pred_boxes']   # [B, T, 49, 4]
     
-    B, T, _, H_grid, W_grid = pred_logits.shape
+    B, T, N_queries, _ = pred_logits_flat.shape
+    H_grid, W_grid = grid_size, grid_size
+    assert N_queries == H_grid * W_grid
+    
+    # Reshape to grid format [B, T, C, H, W]
+    pred_logits = pred_logits_flat.view(B, T, H_grid, W_grid, 1).permute(0, 1, 4, 2, 3).contiguous() # [B, T, 1, 7, 7]
+    pred_boxes = pred_boxes_flat.view(B, T, H_grid, W_grid, 4).permute(0, 1, 4, 2, 3).contiguous()  # [B, T, 4, 7, 7]
+    
     device = pred_logits.device
     
     # --- 1. Create Ground Truth Maps ---
-    # channel 0 = background, channel 1 = foreground
-    gt_cls_map = torch.zeros(B, T, H_grid, W_grid, dtype=torch.long, device=device)
+    # Use float for BCEWithLogitsLoss
+    gt_cls_map = torch.zeros(B, T, H_grid, W_grid, dtype=torch.float, device=device) # [B, T, 7, 7]
     gt_box_map = torch.zeros(B, T, 4, H_grid, W_grid, dtype=torch.float, device=device)
     # Mask to indicate which cells have a GT box (for regression loss)
     regression_mask = torch.zeros(B, T, H_grid, W_grid, dtype=torch.bool, device=device)
@@ -112,7 +70,7 @@ def compute_losses(outputs, targets, loss_weights, grid_size=7):
                 cell_y = (cy_norm * H_grid).clamp(0, H_grid - 1).long()
                 
                 # Assign to maps
-                gt_cls_map[b, t, cell_y, cell_x] = 1 # 1 = foreground class
+                gt_cls_map[b, t, cell_y, cell_x] = 1.0 # 1.0 for float tensor
                 gt_box_map[b, t, :, cell_y, cell_x] = gt_box
                 regression_mask[b, t, cell_y, cell_x] = True
                 total_gt_boxes += 1
@@ -120,20 +78,10 @@ def compute_losses(outputs, targets, loss_weights, grid_size=7):
     if total_gt_boxes == 0:
         total_gt_boxes = 1.0 # Avoid division by zero
         
-    # --- 2. Calculate Classification Loss (Focal Loss) ---
-    # We use all B*T*H*W samples
-    
-    # Flatten inputs for loss:
-    # [B, T, 2, H, W] -> [B*T*H*W, 2]
-    # flat_logits = pred_logits.permute(0, 1, 3, 4, 2).contiguous().view(-1, 2)
-    flat_logits = pred_logits.permute(0, 1, 3, 4, 2).reshape(-1, 2)
-    # [B, T, H, W] -> [B*T*H*W]
-    # flat_gt_cls = gt_cls_map.view(-1)
-    flat_gt_cls = gt_cls_map.reshape(-1)
-
-    
-    focal_loss_fn = FocalLoss()
-    loss_cls = focal_loss_fn(flat_logits, flat_gt_cls)
+    # --- 2. Calculate Classification Loss (BCEWithLogits) ---
+    # Squeeze channel dim from preds: [B, T, 1, 7, 7] -> [B, T, 7, 7]
+    # We compute loss over all grid cells.
+    loss_cls = F.binary_cross_entropy_with_logits(pred_logits.squeeze(2), gt_cls_map, reduction='mean')
     
     # --- 3. Calculate Regression Losses (L1 + GIoU) ---
     # Only use cells that have a GT box
@@ -155,7 +103,6 @@ def compute_losses(outputs, targets, loss_weights, grid_size=7):
         loss_bbox = F.l1_loss(pred_boxes_pos, gt_boxes_pos, reduction='sum') / total_gt_boxes
         
         # GIoU Loss
-        # generalized_box_iou expects xyxy
         pred_xyxy = box_cxcywh_to_xyxy(pred_boxes_pos)
         gt_xyxy = box_cxcywh_to_xyxy(gt_boxes_pos)
         
@@ -182,31 +129,22 @@ def compute_losses(outputs, targets, loss_weights, grid_size=7):
 # ---
 
 @torch.no_grad()
-def calculate_st_iou_batch(pred_logits, pred_boxes, targets, args):
+def calculate_st_iou_batch(pred_logits_flat, pred_boxes_flat, targets, args):
     """
-    Calculates stIoU for the grid-based model output.
+    Calculates stIoU for the 1-CHANNEL model output.
     
-    pred_logits: [N, T, 2, 7, 7]
-    pred_boxes: [N, T, 4, 7, 7]
+    pred_logits_flat: [N, T, 49, 1]
+    pred_boxes_flat: [N, T, 49, 4] (cxcywh)
     targets: list[dict]
     """
-    batch_size = pred_logits.shape[0]
+    batch_size = pred_logits_flat.shape[0]
     num_frames = args.NUM_FRAMES
-    grid_size = args.GRID_SIZE
     
-    # Get foreground scores (class 1 is foreground)
-    # [N, T, 7, 7]
-    foreground_scores = pred_logits[:, :, 1, :, :] # <-- **FIXED**: Use channel 1
+    # Squeeze the last dim: [N, T, 49]
+    foreground_scores_flat = pred_logits_flat.squeeze(-1)
     
-    # Flatten grid to find best prediction
-    # [N, T, 49]
-    foreground_scores_flat = foreground_scores.view(batch_size, num_frames, -1)
     # [N, T]
     best_query_idx = foreground_scores_flat.argmax(dim=-1)
-    
-    # Reshape boxes to match
-    # [N, T, 4, 7, 7] -> [N, T, 4, 49] -> [N, T, 49, 4]
-    pred_boxes_flat = pred_boxes.flatten(3).permute(0, 1, 3, 2).contiguous()
     
     # Gather the best box for each frame
     # (N, T, 1, 1) -> (N, T, 1, 4)
@@ -268,22 +206,16 @@ def train_one_epoch(model, loss_weights, data_loader, optimizer, device, epoch, 
         optimizer.zero_grad(set_to_none=True)
 
         # ---
-        # ** THE FIX IS HERE **
-        # We manually create the model_inputs dict with *only* the keys
-        # our ZaloTrackerNet model accepts.
-        # This removes the 'src_sketch' argument.
+        # ** THE FIX FOR `RuntimeError` IS HERE **
+        # batched_inputs['input_query_image'] is a tuple: (images, masks)
+        # We only want the images, which is the first element [0].
         # ---
-        try:
-            query_images = torch.stack(batched_inputs['input_query_image']).to(device)
-        except TypeError:
-            query_images = batched_inputs['input_query_image'].to(device)
+        query_images = batched_inputs['input_query_image'][0].to(device)
+
         model_inputs = {
-            'input_query_image': batched_inputs['input_query_image'].to(device),
+            'input_query_image': query_images,
             'input_video': batched_inputs['input_video'].to(device)
         }
-        
-        # We also need to move target boxes to device, but we'll do it
-        # inside the compute_losses function as we build the maps.
         
         outputs = model(**model_inputs)
         
@@ -335,20 +267,25 @@ def validate(model, data_loader, device, args):
             continue
 
         # ---
-        # ** THE FIX IS HERE **
-        # Apply the same fix as in the training loop.
+        # ** APPLYING THE SAME FIX HERE **
         # ---
+        query_images = batched_inputs['input_query_image'][0].to(device)
+            
         model_inputs = {
-            'input_query_image': batched_inputs['input_query_image'].to(device),
+            'input_query_image': query_images,
             'input_video': batched_inputs['input_video'].to(device)
         }
         
         outputs = model(**model_inputs)
         
+        # ---
+        # ** FIXING THE METRIC CALL **
+        # Pass the correct model outputs
+        # ---
         inter, union = calculate_st_iou_batch(
             outputs['pred_logits'], 
             outputs['pred_boxes'], 
-            batched_targets, # This function handles moving GTs to device
+            batched_targets, 
             args
         )
         total_intersection += inter
