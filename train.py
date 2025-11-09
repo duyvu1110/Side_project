@@ -273,7 +273,7 @@ def validate(model, data_loader, device, args):
             
         model_inputs = {
             'input_query_image': query_images,
-            'input_video': batched_inputs['input_video'].to(device)
+            'input_video': batched_inputs['input_video'][0].to(device)
         }
         
         outputs = model(**model_inputs)
@@ -389,11 +389,11 @@ def main():
                     print(f"  {k:<20}: {loss_dict[k]:.4f}")
             print(f"  ==> {'total_loss':<20}: {loss_dict['total_loss']:.4f}")
         
-        # Simple validation step (can be expanded)
-        if epoch % 10 == 0 or epoch == args.NUM_EPOCHS:
-             # Using train_loader for validation just to check logic
-             # In a real setup, you'd have a separate validation_loader
-             validate(model, train_loader, device, args) 
+        # # Simple validation step (can be expanded)
+        # if epoch % 10 == 0 or epoch == args.NUM_EPOCHS:
+        #      # Using train_loader for validation just to check logic
+        #      # In a real setup, you'd have a separate validation_loader
+        #      validate(model, train_loader, device, args) 
         
         scheduler.step()
         print(f"--- Epoch {epoch} complete ---")
