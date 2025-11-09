@@ -8,9 +8,9 @@ from scipy.optimize import linear_sum_assignment
 from collections import defaultdict
 import os
 from tqdm import tqdm
-from torch.cuda.amp import GradScaler, autocast
+
 # --- Imports from our other files ---
-from model import build_model
+from tracker_model import ZaloTrackerNet # <-- UPDATED IMPORT
 from dataset import ZaloAIDataset
 from collate_fn import custom_collate_fn, prepare_batch_inputs
 from box_utils import box_cxcywh_to_xyxy, generalized_box_iou
@@ -58,10 +58,10 @@ class PerFrameMatcher(nn.Module):
         """ Performs the matching
         Params:
             outputs: This is a dict that contains at least these entries:
-                 "pred_boxes": Tensor of dim [batch_size, num_queries, 4] with the predicted bbox coordinates
-                 "pred_logits": Tensor of dim [batch_size, num_queries, num_classes] with the classification logits
+                     "pred_boxes": Tensor of dim [batch_size, num_queries, 4] with the predicted bbox coordinates
+                     "pred_logits": Tensor of dim [batch_size, num_queries, num_classes] with the classification logits
             targets: This is a list of targets (len(targets) = batch_size), where each target is a dict containing:
-                 "bboxes": Tensor of dim [num_target_bboxes, 4] containing the target bbox coordinates.
+                     "bboxes": Tensor of dim [num_target_bboxes, 4] containing the target bbox coordinates.
         
         Returns:
             A list of size batch_size, containing tuples of (index_i, index_j) where:
@@ -71,6 +71,7 @@ class PerFrameMatcher(nn.Module):
                 len(index_i) = len(index_j) = min(num_queries, num_target_bboxes)
         """
         bs, num_queries = outputs["pred_boxes"].shape[:2]
+        # ** num_queries now correctly calculated from Config as 32*49 = 1568 **
         assert num_queries == self.num_frames * self.num_queries_per_frame
 
         # We flatten to compute the cost matrices in a batch
@@ -85,8 +86,12 @@ class PerFrameMatcher(nn.Module):
                 for tgt_instance in tgt_frame:  # frame-level
                     tgt_bbox.append(tgt_instance['bbox'])  # instance-level
 
+        # Handle case with no GT boxes in the batch
+        if not tgt_bbox:
+            return [(torch.as_tensor([], dtype=torch.int64), torch.as_tensor([], dtype=torch.int64)) for _ in range(bs)]
+            
         tgt_bbox = torch.stack(tgt_bbox).to(out_bbox.device)  # [total #boxes in batch, 4]
-        tgt_ids = torch.full([tgt_bbox.shape[0]], self.foreground_label)   # [total #boxes in batch]
+        tgt_ids = torch.full([tgt_bbox.shape[0]], self.foreground_label)  # [total #boxes in batch]
 
         # Compute the classification cost. Contrary to the loss, we don't use the NLL,
         # but approximate it in 1 - prob[target class].
@@ -107,8 +112,19 @@ class PerFrameMatcher(nn.Module):
         cum_num_boxes = np.cumsum(num_boxes)
         tgt_offsets = [0] + list(cum_num_boxes[:-1])
         indices = []
+        
+        # This part assumes num_boxes (list of box counts per frame) is correct
+        # C.split(num_boxes, -1) splits C along the last dim based on box counts
+        
+        # i iterates over (batch_size * num_frames)
         for i, (c, o) in enumerate(zip(C.split(num_boxes, -1), tgt_offsets)):
-            pred_ind, tgt_ind = linear_sum_assignment(c[i])
+            # If num_boxes[i] == 0, c[i] will be (num_queries_per_frame, 0)
+            if c[i].shape[1] == 0:
+                pred_ind = np.array([], dtype=np.int64)
+                tgt_ind = np.array([], dtype=np.int64)
+            else:
+                pred_ind, tgt_ind = linear_sum_assignment(c[i])
+                
             pred_ind += i * self.num_queries_per_frame
             tgt_ind += o
             indices.append((pred_ind, tgt_ind))
@@ -121,19 +137,38 @@ class PerFrameMatcher(nn.Module):
         cum_num_queries = np.cumsum([num_queries] * bs)
         pred_offsets = [0] + list(cum_num_queries[:-1])
         indices_per_video = []
-        for indices_, pred_offset in zip(indices, pred_offsets):
+        
+        cum_tgt_boxes_per_video = [0] + list(np.cumsum([sum(t['num_boxes_per_frame']) for t in targets]))
+
+        for i, (indices_, pred_offset) in enumerate(zip(indices, pred_offsets)):
             pred_indices_per_video = []
             tgt_indices_per_video = []
+            
+            # Get the target offset for this *video*
+            tgt_video_offset = cum_tgt_boxes_per_video[i]
+
             for indice in indices_:
                 pred_ind, tgt_ind = indice
-                for pred_idx, tgt_idx in zip(pred_ind, tgt_ind):
-                    pred_indices_per_video.append(pred_idx - pred_offset)
-                    tgt_indices_per_video.append(tgt_idx)
-            tgt_indices_per_video = np.asarray(tgt_indices_per_video)
-            tgt_indices_per_video = list(tgt_indices_per_video - np.min(tgt_indices_per_video))
-            indices_per_video.append((pred_indices_per_video, tgt_indices_per_video))
-        indices = indices_per_video
+                # These are already global batch indices
+                pred_indices_per_video.append(pred_ind)
+                tgt_indices_per_video.append(tgt_ind)
+            
+            if not pred_indices_per_video:
+                 indices_per_video.append((np.array([], dtype=np.int64), np.array([], dtype=np.int64)))
+                 continue
 
+            pred_indices_per_video = np.concatenate(pred_indices_per_video)
+            tgt_indices_per_video = np.concatenate(tgt_indices_per_video)
+            
+            # Make prediction indices relative to the video (0 to num_queries-1)
+            pred_indices_per_video = pred_indices_per_video - pred_offset
+            # Make target indices relative to this video's targets
+            tgt_indices_per_video = tgt_indices_per_video - tgt_video_offset
+
+            indices_per_video.append((pred_indices_per_video, tgt_indices_per_video))
+        
+        indices = indices_per_video
+        
         return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices]
 
 def build_matcher(args):
@@ -142,7 +177,7 @@ def build_matcher(args):
         cost_giou=args.set_cost_giou,
         cost_class=args.set_cost_class,
         num_frames=args.NUM_FRAMES,
-        num_queries_per_frame=args.num_queries_per_frame
+        num_queries_per_frame=args.num_queries_per_frame # <-- Now correctly 49
     )
 
 # From lib.modeling.loss
@@ -156,40 +191,37 @@ class SetCriterion(nn.Module):
         self.foreground_label = 0
         self.background_label = 1
         empty_weight = torch.ones(2)
-        empty_weight[-1] = self.eos_coef
+        empty_weight[self.background_label] = self.eos_coef # Class 1 is background
         self.register_buffer('empty_weight', empty_weight)
 
     def _get_src_permutation_idx(self, indices):
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
         src_idx = torch.cat([src for (src, _) in indices])
         return batch_idx, src_idx
+        
+    def _get_tgt_permutation_idx(self, indices):
+        # build the target indices (this is needed for L1 loss)
+        batch_idx = torch.cat([torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)])
+        tgt_idx = torch.cat([tgt for (_, tgt) in indices])
+        return batch_idx, tgt_idx
 
     def get_num_boxes(self, targets):
         """ Get the total number of GT boxes in the batch """
         num_boxes = sum(t['total_boxes'] for t in targets)
-        
-        # --- THIS IS THE FIX ---
-        # Get device from the registered buffer 'empty_weight' instead of parameters
         num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=self.empty_weight.device)
-        # --- END FIX ---
-        
-        # In a distributed setting, this would be averaged, but for one GPU, this is fine.
         return num_boxes
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
-        src_logits = outputs['pred_logits']
+        src_logits = outputs['pred_logits'] # [B, T*Q, 2]
         idx = self._get_src_permutation_idx(indices)
         
         target_classes = torch.full(src_logits.shape[:2], self.background_label,
                                     dtype=torch.int64, device=src_logits.device)
         target_classes[idx] = self.foreground_label
         
-        # ---
-        # ** FIX: Normalize by num_boxes **
-        # We compute the CE loss for all 320 queries, then take the sum
-        # and normalize by the number of GT boxes (not the number of queries).
-        # ---
         loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight, reduction="none")
+        
+        # Normalize by num_boxes (as fixed in your script)
         losses = {'loss_label': loss_ce.sum() / num_boxes}
 
         if log:
@@ -206,18 +238,35 @@ class SetCriterion(nn.Module):
         src_boxes = outputs['pred_boxes'][idx]
         
         if src_boxes.shape[0] == 0:
-            return {'loss_bbox': torch.tensor(0.0, device=src_boxes.device), 
-                    'loss_giou': torch.tensor(0.0, device=src_boxes.device)}
+            # No matches in this batch
+            return {'loss_bbox': torch.tensor(0.0, device=outputs['pred_boxes'].device), 
+                    'loss_giou': torch.tensor(0.0, device=outputs['pred_boxes'].device)}
         
+        # We need to construct the target boxes tensor in the right order
+        tgt_idx = self._get_tgt_permutation_idx(indices)
+        
+        # Concatenate all target boxes from the batch
         tgt_boxes_list = []
-        for tgt_video in targets:
+        for i, tgt_video in enumerate(targets):
+            video_boxes = []
             for frame_idx in tgt_video['sampled_idxs']:
                 for tgt_instance in tgt_video['bboxes'][frame_idx]:
-                    tgt_boxes_list.append(tgt_instance['bbox'])
+                    video_boxes.append(tgt_instance['bbox'])
+            
+            if video_boxes:
+                tgt_boxes_list.append(torch.stack(video_boxes))
+
+        if not tgt_boxes_list:
+            # No GT boxes in batch, but somehow we got matches? (Shouldn't happen if matcher is correct)
+             return {'loss_bbox': torch.tensor(0.0, device=outputs['pred_boxes'].device), 
+                    'loss_giou': torch.tensor(0.0, device=outputs['pred_boxes'].device)}
         
-        tgt_boxes = torch.stack(tgt_boxes_list).to(src_boxes.device)
-        tgt_perm_idx = torch.cat([tgt for (_, tgt) in indices])
-        tgt_boxes = tgt_boxes[tgt_perm_idx]
+        # This is [Total_GT_Boxes_in_Batch, 4]
+        tgt_boxes_all = torch.cat(tgt_boxes_list).to(src_boxes.device)
+        
+        # The matcher gives indices relative to each video's targets
+        # We need to use the batch/tgt indices to pick the right ones
+        tgt_boxes = tgt_boxes_all[tgt_idx[1]] # Select the matched GT boxes
 
         loss_bbox = F.l1_loss(src_boxes, tgt_boxes, reduction='none')
         loss_giou = 1 - torch.diag(generalized_box_iou(
@@ -226,9 +275,6 @@ class SetCriterion(nn.Module):
         ))
         
         losses = {}
-        # ---
-        # ** FIX: Normalize by num_boxes **
-        # ---
         losses['loss_bbox'] = loss_bbox.sum() / num_boxes
         losses['loss_giou'] = loss_giou.sum() / num_boxes
         return losses
@@ -250,11 +296,9 @@ class SetCriterion(nn.Module):
         
         indices = self.matcher(outputs_without_aux, targets)
         
-        # Get the total number of boxes (our normalization factor)
         num_boxes = self.get_num_boxes(targets)
-        # Avoid division by zero if a batch has 0 boxes
         if num_boxes == 0:
-             num_boxes = 1.0
+             num_boxes = 1.0 # Avoid division by zero
 
         losses = {}
         for loss in self.losses:
@@ -271,15 +315,14 @@ class SetCriterion(nn.Module):
 
 def build_loss(args):
     matcher = build_matcher(args)
-    weight_dict = {"loss_bbox": args.set_cost_bbox,
-                   "loss_giou": args.set_cost_giou,
-                   "loss_label": args.set_cost_class}
+    # Weight dict for matching cost (set_cost_*) is different from
+    # weight dict for final loss (loss_weight_*)
+    weight_dict = {"loss_bbox": args.loss_weight_bbox,
+                   "loss_giou": args.loss_weight_giou,
+                   "loss_label": args.loss_weight_label}
     
-    if args.aux_loss:
-        aux_weight_dict = {}
-        for i in range(args.num_layers - 1):
-            aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
-        weight_dict.update(aux_weight_dict)
+    # aux_loss is not implemented in ZaloTrackerNet, so we can simplify
+    # if args.aux_loss: ...
     
     losses = ['labels', 'boxes']
     return SetCriterion(matcher, weight_dict, args.eos_coef, losses)
@@ -294,24 +337,27 @@ def calculate_st_iou_batch(pred_logits, pred_boxes, targets, args):
     """
     Calculates the cumulative intersection and union for stIoU for a batch.
     
-    pred_logits: [N, 320, 2]
-    pred_boxes: [N, 320, 4] (cxcywh)
+    pred_logits: [N, T*Q, 2]  (e.g., [N, 1568, 2])
+    pred_boxes: [N, T*Q, 4] (cxcywh)
     targets: list[dict]
     """
     batch_size = pred_logits.shape[0]
-    num_frames = args.num_frames
-    num_queries_per_frame = args.num_queries_per_frame
+    num_frames = args.NUM_FRAMES
+    num_queries_per_frame = args.num_queries_per_frame # <-- Now correctly 49
     
     # Reshape predictions to be per-frame
-    # (N, 32, 10, 2)
+    # (N, 32, 49, 2)
     pred_logits = pred_logits.view(batch_size, num_frames, num_queries_per_frame, 2)
-    # (N, 32, 10, 4)
+    # (N, 32, 49, 4)
     pred_boxes = pred_boxes.view(batch_size, num_frames, num_queries_per_frame, 4)
     
     # Find the best query for each frame
     # We find the query with the highest "object" score (class 0)
+    # (N, 32, 49)
+    foreground_scores = pred_logits[..., 0] 
+    
     # best_query_idx shape: (N, 32)
-    best_query_idx = pred_logits[..., 0].argmax(dim=-1)
+    best_query_idx = foreground_scores.argmax(dim=-1)
     
     # Gather the best box for each frame
     # We need to expand best_query_idx to match the box dimensions
@@ -341,7 +387,7 @@ def calculate_st_iou_batch(pred_logits, pred_boxes, targets, args):
                 gt_boxes_list.append(torch.zeros(4, device=pred_xyxy.device))
         
         gt_cxcywh = torch.stack(gt_boxes_list)
-        gt_xyxy = box_cxcywh_to_xyxy(gt_cxcywh)
+        gt_xyxy = box_cxcywh_to_xyxy(gt_cywh)
         
         # Calculate IoU for all 32 frames
         inter_tl = torch.max(pred_xyxy[:, :2], gt_xyxy[:, :2])
@@ -389,7 +435,7 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, arg
                 'num_boxes_per_frame': t['num_boxes_per_frame'],
                 'bboxes': {},
                 'sampled_idxs': t['sampled_idxs'],
-                'total_boxes': t['total_boxes'] # Pass this for normalization
+                'total_boxes': t['total_boxes'] 
             }
             total_gt_boxes_in_batch += t['total_boxes']
             for frame_idx, boxes in t['bboxes'].items():
@@ -406,20 +452,10 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, arg
             for k in loss_dict.keys() if k in criterion.weight_dict
         )
         
-        # ** FIX: The criterion now handles normalization internally **
-        # loss_dict = criterion(outputs, device_targets)
-        
-        # total_loss_batch = sum(
-        #     loss_dict[k] * criterion.weight_dict[k] 
-        #     for k in loss_dict.keys() if k in criterion.weight_dict
-        # )
-        
         if not torch.isfinite(total_loss_batch):
             print(f"Warning: NaN or Inf loss detected at epoch {epoch}. Skipping batch.")
             continue
-        # with torch.cuda.amp.scale_loss(total_loss_batch, optimizer) as scaled_losses:
-        #     scaled_losses.backward()
-        # total_loss_batch.backward()
+        
         total_loss_batch.backward()
         optimizer.step()
         
@@ -427,10 +463,12 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, arg
         avg_loss_dict['total_loss'] += total_loss_batch.item()
         
         with torch.no_grad():
-            indices = criterion.matcher(outputs, device_targets)
-            num_matches = sum(len(i[0]) for i in indices)
-            avg_loss_dict['matches'] += num_matches
-            avg_loss_dict['gt_boxes'] += total_gt_boxes_in_batch
+             # We need to re-run matcher to get stats, or trust criterion's output
+             avg_loss_dict['gt_boxes'] += total_gt_boxes_in_batch
+             # 'class_error' is already logged if present
+             if 'class_error' in loss_dict:
+                 avg_loss_dict['class_error'] += loss_dict['class_error']
+
 
         for k, v in loss_dict.items():
             if k in criterion.weight_dict:
@@ -439,7 +477,7 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, arg
         if num_batches > 0:
             pbar.set_postfix(
                 loss=f"{avg_loss_dict['total_loss'] / num_batches:.4f}",
-                matches=f"{int(avg_loss_dict['matches'] / num_batches)}/{int(avg_loss_dict['gt_boxes'] / num_batches)}"
+                gt_boxes=f"{int(avg_loss_dict['gt_boxes'] / num_batches)}"
             )
 
     if num_batches > 0:
@@ -493,6 +531,10 @@ def validate(model, data_loader, device, args):
         if total_union > 0:
             current_st_iou = total_intersection / total_union
             pbar.set_postfix(stIoU=f"{current_st_iou:.4f}")
+    
+    if total_union == 0:
+        print("Validation: No objects found or predicted, stIoU is 0.")
+        return 0.0
 
     final_st_iou = total_intersection / total_union
     print(f"Validation stIoU: {final_st_iou:.4f}")
@@ -501,40 +543,13 @@ def validate(model, data_loader, device, args):
 # ---
 # 4. MAIN FUNCTION
 # ---
-def nan_hook(module, inputs, output):
-    """
-    A simple hook function to check for NaNs in a module's output.
-    """
-    if isinstance(output, torch.Tensor):
-        if torch.isnan(output).any():
-            print(f"!!! NaN DETECTED IN OUTPUT OF: {module.__class__.__name__} !!!")
-            print("--- Input (first 5 values) ---")
-            if isinstance(inputs, tuple) and inputs:
-                print(inputs[0].detach().cpu().flatten()[:5])
-            print("--- Output (first 5 values) ---")
-            print(output.detach().cpu().flatten()[:5])
-            
-    elif isinstance(output, (list, tuple)):
-        for i, out in enumerate(output):
-             if isinstance(out, torch.Tensor) and torch.isnan(out).any():
-                print(f"!!! NaN DETECTED IN OUTPUT TENSOR {i} OF: {module.__class__.__name__} !!!")
-                print("--- Output (first 5 values) ---")
-                print(out.detach().cpu().flatten()[:5])
-
-def add_nan_check_hooks(model):
-    """
-    Recursively apply the nan_hook to all modules in the model.
-    """
-    for name, module in model.named_children():
-        if module is not None:
-            module.register_forward_hook(nan_hook)
-            add_nan_check_hooks(module) # Recurse
 def main():
     
     # --- 1. Configuration ---
     class Config:
         # --- Paths ---
-        KAGGLE_ROOT = "/kaggle/input/zaloai"
+        # KAGGLE_ROOT = "/kaggle/input/zaloai"
+        KAGGLE_ROOT = "./zalo_data" # <-- Using a local path for testing
         TRAIN_ROOT = os.path.join(KAGGLE_ROOT, "train")
         CHECKPOINT_DIR = "./checkpoints"
 
@@ -545,51 +560,39 @@ def main():
         
         # --- Training ---
         NUM_EPOCHS = 100
-        LR = 1e-4  # We can try a higher LR now that losses are stable
+        LR = 1e-4
         WD = 1e-4
         LR_DROP_STEP = 80
         
-        # --- Model Config ---
-        backbone = 'resnet'
-        sketch_head = 'svanet'
-        hidden_dim = 256
-        nheads = 8
-        num_layers = 4
-        dim_feedforward = 1024
-        num_queries = 320
-        num_input_frames = 32 * 7 * 7
-        num_input_sketches = 1
-        input_dropout = 0.4
-        n_input_proj = 2
-        dropout = 0.1
-        pre_norm = True
-        use_sketch_pos = True
-        sketch_position_embedding = 'sine'
-        video_position_embedding = 'sine'
-        aux_loss = True
-        vis_mode = None
-        input_vid_dim = None
-        input_skch_dim = None
-
+        # ---
+        # ** NEW Model Config **
+        # ---
+        # All old transformer/sketch params are removed
+        # The new model `ZaloTrackerNet` has its own defaults (e.g., feature_dim=256)
+        
         # --- Loss Config ---
         matcher = 'per_frame_matcher'
-        num_queries_per_frame = 10
         
-        # ---
-        # ** NEW WEIGHTS for new normalization **
-        # ---
+        # ** UPDATED Query Counts **
+        # 7x7 grid from the ResNet-34 backbone
+        num_queries_per_frame = 49 
+        # Total queries = frames * queries_per_frame
+        num_queries = NUM_FRAMES * num_queries_per_frame 
+
+        # --- Matcher Costs ---
         set_cost_bbox = 5.0
         set_cost_giou = 1.0
-        set_cost_class = 2.0 # Matcher costs are unchanged
+        set_cost_class = 2.0 
         
-        eos_coef = 0.1 # This is the weight for "no-object" class in loss_label
+        eos_coef = 0.1 # Weight for "no-object" class
         
-        # ---
-        # ** NEW LOSS WEIGHTS for total loss **
-        # ---
+        # --- Final Loss Weights ---
         loss_weight_bbox = 5.0
         loss_weight_giou = 1.0
         loss_weight_label = 2.0
+        
+        # aux_loss is not used by ZaloTrackerNet, so setting to False
+        aux_loss = False 
 
     args = Config()
     os.makedirs(args.CHECKPOINT_DIR, exist_ok=True)
@@ -611,31 +614,24 @@ def main():
 
     # --- 3. Setup Model, Loss, Optimizer ---
     print("Building model...")
-    model = build_model(args).to(device)
+    # ** UPDATED Model Initialization **
+    model = ZaloTrackerNet(num_frames=args.NUM_FRAMES).to(device)
     
-    # ---
-    # ** FIX: Pass new loss weights to build_loss **
-    # ---
     criterion = build_loss(args).to(device)
     
-    # Manually set the final loss weights in the criterion
-    # (The build_loss function you have doesn't do this automatically)
+    # Set the final loss weights in the criterion
     criterion.weight_dict = {
         "loss_bbox": args.loss_weight_bbox,
         "loss_giou": args.loss_weight_giou,
         "loss_label": args.loss_weight_label
     }
-    if args.aux_loss:
-        aux_weight_dict = {}
-        for i in range(args.num_layers - 1):
-            aux_weight_dict.update({k + f'_{i}': v for k, v in criterion.weight_dict.items()})
-        criterion.weight_dict.update(aux_weight_dict)
-    # --- END FIX ---
+    # aux_loss is false, so we don't need the aux_weight_dict part
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.LR, weight_decay=args.WD)
     scheduler = StepLR(optimizer, step_size=args.LR_DROP_STEP, gamma=0.1)
+    
     # --- 4. Training Loop ---
-    print("--- Starting Training ---")
+    print(f"--- Starting Training on {device} ---")
     
     for epoch in range(1, args.NUM_EPOCHS + 1):
         
@@ -648,6 +644,10 @@ def main():
                 if k != 'total_loss':
                     print(f"  {k:<20}: {loss_dict[k]:.4f}")
             print(f"  ==> {'total_loss':<20}: {loss_dict['total_loss']:.4f}")
+        
+        # Simple validation step (can be expanded)
+        if epoch % 10 == 0: # Validate every 10 epochs
+             validate(model, train_loader, device, args) # Using train_loader for validation logic check
         
         scheduler.step()
         print(f"--- Epoch {epoch} complete ---")
