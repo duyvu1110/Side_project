@@ -321,10 +321,10 @@ def main():
         NUM_WORKERS = 4
         
         # --- Training ---
-        NUM_EPOCHS = 200
+        NUM_EPOCHS = 400
         LR = 1e-4
         WD = 1e-4
-        LR_DROP_STEP = 160
+        LR_DROP_STEP = 320
         
         # --- Model Config ---
         GRID_SIZE = 7 # From ResNet-34 layer4
