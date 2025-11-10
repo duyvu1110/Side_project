@@ -39,7 +39,7 @@ def box_cxcywh_to_xyxy(x):
 CHECKPOINT_PATH = "/kaggle/input/test-tracking-model/pytorch/default/1/final_model_epoch400.pth" # Your trained model
 QUERY_IMAGE_PATH = "/kaggle/input/object-image-test/img_1.jpg"
 VIDEO_PATH = "/kaggle/input/test-video/drone_video.mp4"
-JSON_OUTPUT_PATH = "/output_submission.json"
+JSON_OUTPUT_PATH = "/kaggle/working/output_submission.json"
 # ---------------------------------
 
 # --- Hyperparameters ---
