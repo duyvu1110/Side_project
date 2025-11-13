@@ -6,19 +6,11 @@ import cv2
 import numpy as np
 from PIL import Image
 from collections import defaultdict
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 from torchvision import transforms
 from box_utils import box_xyxy_to_cxcywh
-# ---
-from helper_function import load_video_frames_at_indices
-# 1. ZALO AI DATASET CLASS (CORRECTED)
-# ---
 
 class ZaloAIDataset(Dataset):
-    """
-    Dataset for the Zalo AI Challenge data structure.
-    CORRECTED version based on the new annotation format.
-    """
     def __init__(self, root_dir, phase='train', num_frames=32):
         super(ZaloAIDataset, self).__init__()
         
@@ -26,44 +18,41 @@ class ZaloAIDataset(Dataset):
         self.phase = phase
         self.num_frames = num_frames
         
+        # Đường dẫn tới thư mục chứa video và file annotations
         self.samples_dir = os.path.join(self.root_dir, 'samples')
         self.annos_path = os.path.join(self.root_dir, 'annotations', 'annotations.json')
         
-        # 1. Get a list of all sample folders
-        self.sample_names = os.listdir(self.samples_dir)
-        self.sample_names = [s for s in self.sample_names if not s.startswith('.')]
+        # 1. Lấy danh sách các folder mẫu (VD: Backpack_0, Lifering_1, ...)
+        self.sample_names = [s for s in os.listdir(self.samples_dir) if not s.startswith('.')]
         
-        # 2. **NEW: Load and process the annotations**
+        # 2. Load toàn bộ annotations vào bộ nhớ và tạo dictionary tra cứu nhanh
         print(f"Loading annotations from {self.annos_path}...")
-        try:
-            with open(self.annos_path) as f:
-                all_annos_list = json.load(f)
-        except FileNotFoundError:
-            print(f"FATAL ERROR: Annotation file not found at {self.annos_path}")
-            raise
+        with open(self.annos_path) as f:
+            all_annos_list = json.load(f)
             
-        # 3. **NEW: Convert annotations list to a fast-lookup dictionary**
         self.annos_dict = {}
         for item in all_annos_list:
             video_id = item['video_id']
+            # Tạo lookup map: { frame_index: [list of boxes] }
             frame_to_box_map = defaultdict(list)
             
+            # Duyệt qua các track (đối tượng) trong video
             for track_id, track in enumerate(item['annotations']):
                 for bbox_info in track['bboxes']:
                     frame_idx = bbox_info['frame']
+                    # Format gốc của bạn: [x1, y1, x2, y2]
                     box = [
                         bbox_info['x1'], bbox_info['y1'],
                         bbox_info['x2'], bbox_info['y2']
                     ]
+                    # Lưu kèm track_id để model hiểu đó là cùng 1 vật thể
                     frame_to_box_map[frame_idx].append({
                         'track_id': track_id, 
                         'box': box
                     })
-            
             self.annos_dict[video_id] = frame_to_box_map
-        print(f"Loaded and processed {len(self.annos_dict)} video annotations.")
-
-        # 4. Define the transforms
+            
+        # 3. Định nghĩa Transform (Chuẩn hóa theo ImageNet)
         self.transform = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
@@ -75,115 +64,113 @@ class ZaloAIDataset(Dataset):
         return len(self.sample_names)
 
     def __getitem__(self, idx):
-        # 1. Get the sample info
-        sample_name = self.sample_names[idx]
+        # Lấy thông tin mẫu hiện tại
+        sample_name = self.sample_names[idx] # VD: "Backpack_0"
         sample_path = os.path.join(self.samples_dir, sample_name)
+        category = sample_name.split('_')[0] # VD: "Backpack"
         
-        # --- 2. Load Query RGB Image (Randomly selected) ---
+        # --- PHẦN 1: XỬ LÝ INPUT ẢNH QUERY (Thay thế Sketch) ---
+        # Lấy ngẫu nhiên 1 ảnh từ thư mục object_images
         img_idx = random.randint(1, 3)
         img_name = f"img_{img_idx}.jpg"
         img_path = os.path.join(sample_path, 'object_images', img_name)
         
         try:
             query_img = Image.open(img_path).convert('RGB')
-        except FileNotFoundError:
-            # print(f"Error: Query image not found at {img_path}")
-            return None # Skip this sample
-            
-        query_img_tensor = self.transform(query_img)
-        
-        # --- 3. Get Video Info & Sampled Indices ---
-        video_path = os.path.join(sample_path, 'drone_video.mp4')
-        try:
-            cap = cv2.VideoCapture(video_path)
-            total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            cap.release()
+            query_tensor = self.transform(query_img)
+            # Thêm dimension batch ảo: (3, 224, 224) -> (1, 3, 224, 224)
+            # Để giả lập input này giống như 1 "sketch sequence" có độ dài 1
+            query_tensor = query_tensor.unsqueeze(0)
         except Exception as e:
-            # print(f"Error reading video info: {video_path} | {e}")
+            # print(f"Error loading image: {img_path}")
             return None
 
-        if total_video_frames <= 0 or w <= 0 or h <= 0:
-            # print(f"Video file has no frames or invalid dims: {video_path}")
-            return None
+        # --- PHẦN 2: XỬ LÝ VIDEO (Lấy mẫu Frames) ---
+        video_path = os.path.join(sample_path, 'drone_video.mp4')
+        cap = cv2.VideoCapture(video_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        if total_frames <= 0: return None
 
-        sampling_rate = total_video_frames / self.num_frames
-        sampled_idxs = [int(round(sampling_rate * i)) for i in range(self.num_frames)]
-        sampled_idxs = [min(max(0, i), total_video_frames - 1) for i in sampled_idxs]
+        # Tính toán các frame cần lấy (chia đều video thành 32 đoạn)
+        sampled_idxs = [int(round((total_frames / self.num_frames) * i)) for i in range(self.num_frames)]
+        sampled_idxs = [min(max(0, i), total_frames - 1) for i in sampled_idxs]
         
-        # --- 4. Load Video Frames ---
-        video_pil_frames = load_video_frames_at_indices(video_path, sampled_idxs)
-        video_tensor = torch.stack(
-            [self.transform(frame) for frame in video_pil_frames], 
-            dim=0
-        )
-        
-        # --- 5. Load Targets (Using our new annos_dict) ---
-        if sample_name not in self.annos_dict:
-            # print(f"Warning: No annotation entry found for video_id: {sample_name}")
-            return None
+        # Đọc video tại các vị trí đã chọn
+        video_tensors = []
+        for frame_idx in sampled_idxs:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            if not ret:
+                # Fallback: Dùng frame đen nếu lỗi
+                frame = np.zeros((224, 224, 3), dtype=np.uint8)
+            else:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
-        gt_lookup = self.annos_dict[sample_name] 
+            frame_pil = Image.fromarray(frame)
+            video_tensors.append(self.transform(frame_pil))
+        cap.release()
         
-        targets = dict()
-        bboxes = defaultdict(list)
-        num_boxes_per_frame = [0] * self.num_frames
+        # Stack lại thành tensor (T, C, H, W)
+        video_tensor = torch.stack(video_tensors, dim=0)
+
+        # --- PHẦN 3: TẠO TARGETS (Chuyển đổi format quan trọng) ---
+        if sample_name not in self.annos_dict: return None
+        gt_lookup = self.annos_dict[sample_name]
+        
+        # Cấu trúc targets bắt buộc của SVOL
+        targets = {
+            'video': sample_name,
+            'size': [w, h],
+            'category': category,
+            'sampled_idxs': sampled_idxs, # Để dùng cho Matcher
+            'bboxes': defaultdict(list),  # { frame_idx: [boxes] }
+            'num_boxes_per_frame': []
+        }
+        
+        all_track_ids = set()
         
         for i, frame_idx in enumerate(sampled_idxs):
             frame_boxes = []
+            # Nếu frame này có annotation
             if frame_idx in gt_lookup:
                 for gt_obj in gt_lookup[frame_idx]:
+                    # 1. Lấy box gốc [x1, y1, x2, y2]
+                    box = gt_obj['box']
                     
-                    # ---
-                    # **THE FIX IS HERE**
-                    # ---
-                    box = gt_obj['box'] # [x1, y1, x2, y2]
+                    # 2. Đảm bảo tọa độ hợp lệ và nằm trong ảnh
+                    valid_x1 = max(0, min(box[0], box[2]))
+                    valid_y1 = max(0, min(box[1], box[3]))
+                    valid_x2 = min(w, max(box[0], box[2]))
+                    valid_y2 = min(h, max(box[1], box[3]))
                     
-                    # 1. Ensure x1 < x2 and y1 < y2
-                    valid_x1 = min(box[0], box[2])
-                    valid_y1 = min(box[1], box[3])
-                    valid_x2 = max(box[0], box[2])
-                    valid_y2 = max(box[1], box[3])
-
-                    # 2. Clamp to image boundaries
-                    valid_x1 = max(0, valid_x1)
-                    valid_y1 = max(0, valid_y1)
-                    valid_x2 = min(w, valid_x2)
-                    valid_y2 = min(h, valid_y2)
-                    
-                    # 3. Create the valid tensor
+                    # 3. Tạo tensor xyxy
                     xyxy_box = torch.tensor([valid_x1, valid_y1, valid_x2, valid_y2], dtype=torch.float32)
-
-                    # Skip zero-area boxes, which can also cause errors
-                    if (xyxy_box[2] <= xyxy_box[0]) or (xyxy_box[3] <= xyxy_box[1]):
-                        continue
                     
-                    # --- END FIX ---
-                    
+                    # 4. BƯỚC QUAN TRỌNG: Chuyển sang cxcywh và Chuẩn hóa (0-1)
+                    # Model yêu cầu format này để tính loss!
                     cxcywh_box = box_xyxy_to_cxcywh(xyxy_box)
                     norm_box = cxcywh_box / torch.tensor([w, h, w, h], dtype=torch.float32)
                     
                     frame_boxes.append({
                         'track_id': gt_obj['track_id'],
-                        'bbox': norm_box
+                        'bbox': norm_box # Box đã chuẩn hóa
                     })
+                    all_track_ids.add(gt_obj['track_id'])
             
-            bboxes[frame_idx] = frame_boxes
-            num_boxes_per_frame[i] = len(frame_boxes)
+            targets['bboxes'][frame_idx] = frame_boxes
+            targets['num_boxes_per_frame'].append(len(frame_boxes))
 
-        total_boxes = sum(num_boxes_per_frame)
-        
-        # --- 6. Prepare Model Inputs and Targets ---
-        model_inputs = dict()
-        model_inputs['input_query_image'] = query_img_tensor.unsqueeze(0)
-        model_inputs['input_video'] = video_tensor
-        
-        targets['video'] = sample_name
-        targets['size'] = [w, h]
-        targets['total_boxes'] = total_boxes
-        targets['num_boxes_per_frame'] = num_boxes_per_frame
-        targets['bboxes'] = bboxes
-        targets['sampled_idxs'] = sampled_idxs 
-        
+        targets['total_boxes'] = sum(targets['num_boxes_per_frame'])
+        targets['track_ids'] = list(all_track_ids)
+
+        # --- PHẦN 4: ĐÓNG GÓI INPUT ---
+        model_inputs = {
+            # Đặt tên là src_sketch để khớp với model SVOL, dù ta truyền ảnh RGB
+            'input_query_image': query_tensor, 
+            'input_video': video_tensor
+        }
+
         return dict(model_inputs=model_inputs, targets=targets)
